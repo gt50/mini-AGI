@@ -181,15 +181,64 @@ def bench_step(dev, wdir, chunk, context, reps, lr=3e-4):
 
     if dev.type == "cuda":
         torch.cuda.reset_peak_memory_stats()
+    from minagi.pool import PooledMLP
+    sites = [m for m in model.modules() if isinstance(m, PooledMLP)]
+    for s in sites:
+        s.dropped = s.routed = 0
     ms = timed(step, dev, reps, warm=1)
+    routed = sum(s.routed for s in sites)
+    dropped = sum(s.dropped for s in sites) / max(routed, 1)
     peak = (torch.cuda.max_memory_allocated() / (1 << 30)
             if dev.type == "cuda" else None)
     rep = pool.report() if hasattr(pool, "report") else {}
     return {"chunk": chunk, "context": context, "step_ms": ms,
             "chars_per_s": chunk / (ms * 1e-3), "peak_gb": peak,
+            "capacity_factor": sites[0].capacity_factor if sites else None,
+            "dropped_share": dropped,
             "resident": pool.resident, "experts": pool.n_experts(),
             "loads": getattr(pool, "loads", None),
             "tier_hit_rate": rep.get("hit_rate")}
+
+
+def bench_decode(dev, wdir, n_chars, prompt_len=512):
+    """
+    Writing: one character per forward behind a cache, as serve.py and the
+    sample log write. Timed with the expert dispatch running every expert on
+    the card, and running only the ones each character chose.
+    """
+    from minagi.build import build_paged
+    from minagi.pool import PooledMLP
+    from minagi.precision import amp
+
+    model, cfg, pool, _ = build_paged(wdir, dev, read_only=True)
+    model.eval()
+    sites = [m for m in model.modules() if isinstance(m, PooledMLP)]
+    prompt_len = max(1, min(prompt_len, cfg.block - n_chars - 2))
+    g = torch.Generator().manual_seed(0)
+    prompt = torch.randint(32, 127, (1, prompt_len), generator=g).to(dev)
+    out = {"resident": pool.resident, "experts": pool.n_experts()}
+    for name, subset in (("all_experts", False), ("chosen_only", True)):
+        for s in sites:
+            s.subset_dispatch = subset
+        caches = model.empty_caches()
+        with torch.no_grad(), amp(dev):
+            logits = model(prompt, caches=caches)[0]
+            cur = logits[:, -1:].argmax(-1)
+            pos = prompt_len
+            model(cur, caches=caches, pos_offset=pos)       # warm
+            pos += 1
+            sync(dev)
+            t = time.perf_counter()
+            for _ in range(n_chars):
+                logits = model(cur, caches=caches, pos_offset=pos)[0]
+                cur = logits[:, -1:].argmax(-1)
+                pos += 1
+            sync(dev)
+        dt = time.perf_counter() - t
+        out[name] = {"chars_per_s": n_chars / dt,
+                     "ms_per_char": dt * 1e3 / n_chars,
+                     "rows_per_char": getattr(model, "last_steps", None)}
+    return out
 
 
 def bench_paging(dev, wdir, reps):
@@ -232,7 +281,10 @@ def main():
                     help="fewer repetitions and shorter windows")
     ap.add_argument("--out", default=None)
     ap.add_argument("--skip", default="",
-                    help="comma list of attention,experts,step,paging")
+                    help="comma list of attention,experts,step,paging,decode")
+    ap.add_argument("--weights", default=None,
+                    help="time writing on this weights directory (opened "
+                         "read-only) instead of a throwaway model")
     a = ap.parse_args()
 
     from minagi import device as hwdev
@@ -286,7 +338,20 @@ def main():
               f"({e['fwd_tflops']:.1f} TFLOP/s)  fwd+bwd "
               f"{e['fwd_bwd_ms']:.2f} ms ({e['fwd_bwd_tflops']:.1f} TFLOP/s)")
 
-    if not ({"step", "paging"} <= skip):
+    def show_decode(d):
+        for k in ("all_experts", "chosen_only"):
+            v = d[k]
+            print(f"  {k:12} {v['chars_per_s']:7.1f} char/s  "
+                  f"({v['ms_per_char']:.0f} ms a character)")
+
+    if "decode" not in skip and a.weights:
+        res["decode"] = bench_decode(dev, a.weights, 16 if a.quick else 64)
+        print(f"\nwriting, {a.weights} ({res['decode']['resident']} on the "
+              f"card of {res['decode']['experts']}):")
+        show_decode(res["decode"])
+
+    if not ({"step", "paging"} <= skip) or ("decode" not in skip
+                                             and not a.weights):
         from minagi.create import create
         tmp = tempfile.mkdtemp(prefix="minagi-bench-")
         wdir = os.path.join(tmp, "weights")
@@ -299,6 +364,10 @@ def main():
                     print(f"  tier in {k:6}: disk -> tier "
                           f"{v['disk_to_tier_ms']:.1f} ms, tier -> slot "
                           f"{v['tier_to_slot_ms_2_of_3_tensors']:.2f} ms")
+            if "decode" not in skip and not a.weights:
+                res["decode"] = bench_decode(dev, wdir, 16 if a.quick else 64)
+                print("\nwriting, throwaway model:")
+                show_decode(res["decode"])
             if "step" not in skip:
                 res["step"] = bench_step(dev, wdir, chunk, ctx,
                                          2 if a.quick else 5)
@@ -307,7 +376,9 @@ def main():
                       if s["peak_gb"] is not None else "")
                 print(f"\ntraining step: {s['chunk']} characters behind "
                       f"{s['context']}: {s['step_ms']:.0f} ms, "
-                      f"{s['chars_per_s']:,.0f} char/s{pk}")
+                      f"{s['chars_per_s']:,.0f} char/s{pk}, capacity "
+                      f"{s['capacity_factor']:g} dropped "
+                      f"{100 * s['dropped_share']:.1f}% of routing")
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 

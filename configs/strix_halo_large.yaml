@@ -96,8 +96,16 @@ pool:
   ram_cache: 0            # 0 = every expert stays in the tier, which here
                           # is device memory: disk is read once per expert
 
-  capacity_factor: 1.5    # most of a batch one expert may take, as a multiple
+  capacity_factor: 0      # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
+                          # the cap. The cap exists to bound memory on an 8 GB
+                          # card; with 128 experts on the card a fresh model's
+                          # router piles onto a few, and at 1.5 it dropped 59%
+                          # of routing in tools/bench_hw.py (76% in a real
+                          # run's first minutes) - most of what the experts
+                          # could learn. Uncapped, a step was 27% slower and
+                          # peaked at 22.8 GB instead of 17.8. Measured on the
+                          # 8060S: 3 dropped 41%, 6 dropped 25%
 
   # THE BALANCE TERM - how the whole pool gets used. Left alone the router
   # keeps choosing the same experts: reading held-out on its own it put 59 of
