@@ -14,6 +14,13 @@ Four lanes come down from Hugging Face. Four are made here from things already
 on the machine - Python packages for code, a PGN for chess, and pure synthesis
 for arithmetic and the self-knowledge turns.
 
+The generated chat lane - primal chat and the self-knowledge turns - and the
+OpenHermes download share data/train/chat: the download sits in its hermes/
+sub-folder, the generated files beside it. They are held out separately, as
+data/val/chat and data/val/chat_hermes, because rebuilding the generated lane
+clears its own files from data/{train,val}/chat - which, when OpenHermes held
+out into the same folder, silently deleted OpenHermes' held-out set.
+
 A lane that already has files is left alone, so an interrupted build can
 simply be run again; `--force` rebuilds it anyway. A lane that fails does not
 stop the others - what failed is named at the end so it can be retried on its
@@ -21,6 +28,7 @@ own with `--only`.
 """
 
 import argparse
+import glob
 import os
 import subprocess
 import sys
@@ -36,11 +44,19 @@ SAMPLED = {"wikipedia": 120_000, "stories": 400_000,
            "chat": 200_000, "reasoning": 20_000}
 
 
-def _has_files(d):
-    for _, _, files in os.walk(d):
-        if files:
-            return True
-    return False
+def _files(where):
+    """A lane's files: everything under a directory, or what a glob matches.
+
+    A glob, because the generated chat lane writes chat-*.txt into a folder
+    that also holds the OpenHermes download, so "the folder has files" is
+    true of it before the lane has been built at all."""
+    if any(c in where for c in "*?["):
+        return [f for f in glob.glob(where) if os.path.isfile(f)]
+    return [os.path.join(r, f) for r, _, fs in os.walk(where) for f in fs]
+
+
+def _has_files(where):
+    return bool(_files(where))
 
 
 def _sub(*args):
@@ -87,7 +103,7 @@ def build_chat(limit):
     return _sub("fetch", "--dataset", "teknium/OpenHermes-2.5",
                 "--kind", "chat", "--limit", limit, "--hold", _hold(limit),
                 "--out", "data/train/chat/hermes",
-                "--held-out", "data/val/chat")
+                "--held-out", "data/val/chat_hermes")
 
 
 def build_reasoning(limit):
@@ -126,7 +142,9 @@ BUILDERS = {
     "arithmetic":     (build_arithmetic,     "data/train/arithmetic"),
     "code":           (build_code,           "data/train/code"),
     "chess":          (build_chess,          "data/train/chess"),
-    "self-knowledge": (build_self_knowledge, "data/train/self-knowledge"),
+    # the generated lane lands in data/train/chat, next to hermes/ - see the
+    # module docstring
+    "self-knowledge": (build_self_knowledge, "data/train/chat/chat-*.txt"),
 }
 
 
@@ -161,7 +179,7 @@ def main():
     failed, skipped = [], []
     for name in wanted:
         fn, where = BUILDERS[name]
-        if not a.force and os.path.isdir(where) and _has_files(where):
+        if not a.force and _has_files(where):
             print(f"== {name}: already in {where} - skipping "
                   f"(--force to rebuild)")
             skipped.append(name)
@@ -180,13 +198,10 @@ def main():
     total = 0
     for name in LANES:
         where = BUILDERS[name][1]
-        if not os.path.isdir(where):
+        files = _files(where)
+        if not files:
             continue
-        n = mb = 0
-        for root, _, files in os.walk(where):
-            for f in files:
-                n += 1
-                mb += os.path.getsize(os.path.join(root, f))
+        n, mb = len(files), sum(os.path.getsize(f) for f in files)
         total += mb
         print(f"  {name:<16} {n:>7,} files  {mb / 1e6:>8,.0f} MB")
     print(f"  {'TOTAL':<16} {'':>7}         {total / 1e6:>8,.0f} MB")

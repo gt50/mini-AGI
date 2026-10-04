@@ -89,7 +89,7 @@ def _refuse_foreign():
 PRIME = ""
 
 
-def load_prime(chars, root="data/train/self-knowledge"):
+def load_prime(chars, root="data/train/chat"):
     """
     Corpus text to open the conversation with, or "" if there is none.
 
@@ -99,8 +99,9 @@ def load_prime(chars, root="data/train/self-knowledge"):
     context has voted for. And the learning stream starts part-way to its
     first step rather than twenty exchanges short of one.
 
-    Taken from the self-knowledge lane because it is already in the register
-    the chat is in - <user>/<bot> turns about what the model is - so this is
+    Taken from the generated chat lane, where `python -m corpora all` puts
+    the self-knowledge turns (corpora/chat.py), because it is already in the
+    register the chat is in - <user>/<bot> turns about what the model is - so this is
     text the model has read, not a preamble invented here and trained on.
     The `self-` files are the short question-and-answer ones; `auto-src-` are
     whole source files quoted back, and priming with one of those biases the
