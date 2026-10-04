@@ -231,8 +231,12 @@ hardware:
   unified: true
   ram_tier_on_gpu: true      # the expert RAM tier lives on the device: a
                              # page-in is a device-to-device copy
-  expandable_segments: true  # turn off if your ROCm build warns it is
-                             # unsupported (some Windows builds)
+  expandable_segments: false  # IGNORED by ROCm on Windows, which warns
+                              # "not supported on this platform". It is what
+                              # stops the allocator fragmenting elsewhere; here
+                              # minagi/pool.py rounds the expert buffer to a few
+                              # sizes instead. Measured before that: 49 GB
+                              # reserved for 17 GB live, half speed, a crash
   rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
                              # 4k window builds its whole T x T scores per row
   tunableop: false           # OFF on purpose. The expert dispatch's batched

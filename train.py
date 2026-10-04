@@ -1010,6 +1010,16 @@ def cmd_read(args):
                    "born": t["born"],
                    "last_seen": t.get("last_seen"), "uid": t.get("uid"),
                    "trial": getattr(model.pool, "trial", 0)}
+            if device.type == "cuda":
+                # what this process holds on the card, so a run that slows
+                # down or dies can be checked for memory that only grows:
+                # allocated is live tensors, reserved what the caching
+                # allocator keeps, peak the most allocated since the start
+                mb = 1 << 20
+                row.update(
+                    mem_alloc_mb=round(torch.cuda.memory_allocated() / mb),
+                    mem_reserved_mb=round(torch.cuda.memory_reserved() / mb),
+                    mem_peak_mb=round(torch.cuda.max_memory_allocated() / mb))
             os.makedirs(os.path.dirname(args.history) or ".", exist_ok=True)
             with open(args.history, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, separators=(",", ":")) + "\n")

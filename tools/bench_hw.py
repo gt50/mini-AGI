@@ -203,8 +203,9 @@ def bench_step(dev, wdir, chunk, context, reps, lr=3e-4):
 def bench_decode(dev, wdir, n_chars, prompt_len=512):
     """
     Writing: one character per forward behind a cache, as serve.py and the
-    sample log write. Timed with the expert dispatch running every expert on
-    the card, and running only the ones each character chose.
+    sample log write. Timed with the expert dispatch as one padded rectangle
+    over every expert on the card, and grouped - only the experts each
+    character chose.
     """
     from minagi.build import build_paged
     from minagi.pool import PooledMLP
@@ -217,9 +218,9 @@ def bench_decode(dev, wdir, n_chars, prompt_len=512):
     g = torch.Generator().manual_seed(0)
     prompt = torch.randint(32, 127, (1, prompt_len), generator=g).to(dev)
     out = {"resident": pool.resident, "experts": pool.n_experts()}
-    for name, subset in (("all_experts", False), ("chosen_only", True)):
+    for name, subset in (("rectangle", False), ("grouped", True)):
         for s in sites:
-            s.subset_dispatch = subset
+            s.grouped_dispatch = subset
         caches = model.empty_caches()
         with torch.no_grad(), amp(dev):
             logits = model(prompt, caches=caches)[0]
@@ -339,7 +340,7 @@ def main():
               f"{e['fwd_bwd_ms']:.2f} ms ({e['fwd_bwd_tflops']:.1f} TFLOP/s)")
 
     def show_decode(d):
-        for k in ("all_experts", "chosen_only"):
+        for k in ("rectangle", "grouped"):
             v = d[k]
             print(f"  {k:12} {v['chars_per_s']:7.1f} char/s  "
                   f"({v['ms_per_char']:.0f} ms a character)")

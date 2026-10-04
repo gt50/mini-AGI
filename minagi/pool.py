@@ -335,10 +335,10 @@ class PooledMLP(nn.Module):
         # ...and the denominator, so the counter reads as a share of the
         # work rather than as a number nobody can scale.
         self.routed = 0
-        # Run only the experts a call actually chose when they are at most
-        # half the card - see the dispatch. Off reproduces the old path, which
-        # the tests compare against.
-        self.subset_dispatch = True
+        # Group the chosen experts by load and run each group at its own size
+        # - see the dispatch. Off reproduces the single padded rectangle,
+        # which the tests compare against.
+        self.grouped_dispatch = True
 
     @property
     def pool(self):
@@ -573,66 +573,119 @@ class PooledMLP(nn.Module):
                 self.dropped += int((~keep).sum())
                 e_sorted, t_sorted = e_sorted[keep], t_sorted[keep]
                 w_sorted, slot = w_sorted[keep], slot[keep]
+                counts = counts.clamp(max=limit)
                 cap = limit
 
-        # ONLY THE EXPERTS THAT WERE CHOSEN RUN. The buffer is [n, cap, D] and
-        # every matmul below reads every expert's weights - and casts them to
-        # the compute dtype - whether or not anything was routed to it. A
-        # training chunk of 2,048 characters reaches nearly every expert on
-        # the card, so that costs nothing there. A character being written is
-        # a forward of its own and reaches top_k of them: with 128 on the
-        # card, every row read and cast all 128 to run 8, and writing was
-        # bound by memory bandwidth - 2.9 characters a second on Strix Halo.
-        #
-        # So when at most half the experts are in use, the weights of just
-        # those are gathered first. Half, because the gather copies them in
-        # fp32 before the cast; below that the copy is no larger than the
-        # cast of the whole card it replaces, so peak memory never rises.
-        sub = None
-        if self.subset_dispatch and n > 1:
-            if N == 1:
-                # sorted and distinct already, and the count is known here
-                present = e_sorted
-            else:
-                present = torch.nonzero(counts > 0).squeeze(1)
-            m = int(present.numel())
-            if 0 < m * 2 <= n:
-                remap = torch.full((n,), -1, dtype=torch.long,
-                                   device=flat.device)
-                remap[present] = torch.arange(m, device=flat.device)
-                e_sorted = remap[e_sorted]
-                sub, n = present, m
+        # The slot buffer, and everything computed from it, in the COMPUTE
+        # dtype rather than the residual stream's. The residual stays fp32 by
+        # design; the dispatch does not need to, and halving this buffer is
+        # the difference between fitting on the card and not. Autocast does
+        # not do it for us: the weights are cast TO the buffer's dtype below,
+        # so the matmuls run at whatever the buffer is.
+        dt = compute_dtype() if flat.device.type == "cuda" else flat.dtype
 
-        def pick(W):
-            return W if sub is None else W.index_select(0, sub)
+        # GROUPED BY LOAD. One padded rectangle [n, cap, D] pads every expert
+        # to the BUSIEST expert's load. Routing here grows "sink" experts that
+        # nearly every character picks among its top_k - measured on the large
+        # Strix profile, 1,960 of 2,081 characters at a typical row, 15x the
+        # fair share with 128 experts on the card - so one rectangle computed
+        # 16x the work the routing asked for, slowed training by half as the
+        # sinks formed, and its buffers grew until one failed to allocate.
+        #
+        # So the experts this call chose are sorted into groups by their own
+        # load, rounded with _bucket, and each group runs its own three
+        # batched matmuls at its own size. Nothing is dropped that the
+        # capacity factor did not drop, and the work is at most twice the
+        # routing's instead of n times the worst expert's. The buckets also
+        # keep the allocator to a few dozen buffer sizes: on ROCm for Windows,
+        # which ignores expandable_segments, a buffer of a new size every call
+        # fragmented 17 GB of live tensors into 49 GB reserved.
+        #
+        # Only experts something was routed to run, so a character being
+        # written - which reaches top_k of the card - reads and casts top_k
+        # experts' weights, not the whole card's. Where most of the card is in
+        # use the weights are cast once and the groups gather from the cast;
+        # where few are, each group gathers its fp32 experts and casts those.
+        groups = None
+        cast_first = False
+        if self.grouped_dispatch and n > 1:
+            if N == 1:
+                # one character: top_k distinct experts, one assignment each,
+                # already sorted - no need to ask the device for the counts
+                k_ = int(e_sorted.numel())
+                groups = [(1, 0, k_, 0, k_)]
+                seq_t = e_sorted
+                e_rank = torch.arange(k_, device=flat.device)
+                used = k_
+            else:
+                cl = counts.tolist()
+                by = {}
+                for e, c in enumerate(cl):
+                    if c > 0:
+                        by.setdefault(_bucket(c), []).append(e)
+                used = sum(len(v) for v in by.values())
+                if not (len(by) == 1 and used == n):
+                    seq = [e for c in sorted(by) for e in by[c]]
+                    seq_t = torch.tensor(seq, device=flat.device)
+                    rank = torch.full((n,), -1, dtype=torch.long,
+                                      device=flat.device)
+                    rank[seq_t] = torch.arange(len(seq), device=flat.device)
+                    r = rank[e_sorted]
+                    o2 = torch.argsort(r, stable=True)
+                    e_rank, t_sorted = r[o2], t_sorted[o2]
+                    w_sorted, slot = w_sorted[o2], slot[o2]
+                    groups, r0, a0 = [], 0, 0
+                    for c in sorted(by):
+                        es = by[c]
+                        a1 = a0 + sum(cl[e] for e in es)
+                        groups.append((c, r0, len(es), a0, a1))
+                        r0, a0 = r0 + len(es), a1
+            cast_first = groups is not None and used * 2 > n
+        if groups is None:
+            # every expert on the card at one load - or grouping is off - so
+            # one rectangle, rounded to a bucket (see above)
+            cap = _bucket(cap)
+
+        def experts(lv, buf):
+            """The stacked experts over one slot buffer [m, cap, D]."""
+            x = buf
+            for W1, W3, W2 in lv:
+                h = F.silu(torch.bmm(x, W1.transpose(1, 2))) * \
+                    torch.bmm(x, W3.transpose(1, 2))
+                y = torch.bmm(h, W2.transpose(1, 2))
+                # deeper experts stack residually, so an expert of any depth
+                # can still be added to the mixture without changing its scale
+                x = y if len(lv) == 1 else x + y
+            return x
 
         def run(src, *ws):
             lv = [(ws[i], ws[i + 1], ws[i + 2]) for i in range(0, len(ws), 3)]
-            # The slot buffer, and everything computed from it, in the COMPUTE
-            # dtype rather than the residual stream's. The residual stays fp32
-            # by design; the dispatch does not need to, and halving this buffer
-            # is the difference between fitting on the card and not. Autocast
-            # does not do it for us: the weights are cast TO buf's dtype a few
-            # lines below, so the matmul runs at whatever buf is.
-            dt = compute_dtype()
-            if src.device.type != "cuda":
-                dt = src.dtype
-            buf = torch.zeros(n, cap, D, device=src.device, dtype=dt)
-            buf[e_sorted, slot] = src[t_sorted].to(dt)
-            if len(lv) == 1:
-                W1, W3, W2 = (pick(t) for t in lv[0])
-                h = F.silu(torch.bmm(buf, W1.transpose(1, 2).to(buf.dtype))) * \
-                    torch.bmm(buf, W3.transpose(1, 2).to(buf.dtype))
-                y = torch.bmm(h, W2.transpose(1, 2).to(buf.dtype))  # [n,cap,D]
-                return y[e_sorted, slot].to(src.dtype)
-            # deeper experts stack residually, so an expert of any depth can
-            # still be added to the mixture without changing its scale
-            x = buf
-            for W1, W3, W2 in ((pick(a), pick(b), pick(c)) for a, b, c in lv):
-                h = F.silu(torch.bmm(x, W1.transpose(1, 2).to(x.dtype))) * \
-                    torch.bmm(x, W3.transpose(1, 2).to(x.dtype))
-                x = x + torch.bmm(h, W2.transpose(1, 2).to(x.dtype))
-            return x[e_sorted, slot].to(src.dtype)
+            if groups is None:
+                buf = torch.zeros(n, cap, D, device=src.device, dtype=dt)
+                buf[e_sorted, slot] = src[t_sorted].to(dt)
+                lvc = [tuple(W.to(dt) for W in t) for t in lv]
+                return experts(lvc, buf)[e_sorted, slot].to(src.dtype)
+            # ONE gather per weight, every chosen expert in group order, then
+            # split into the groups' views. A gather per group was slower than
+            # the rectangle it replaced: each one's backward is a zero tensor
+            # the size of the whole card, so twenty groups cost twenty of them
+            # a row. A split's backward is one concatenation.
+            sizes = [g[2] for g in groups]
+
+            def gather(W):
+                G = (W.to(dt).index_select(0, seq_t) if cast_first
+                     else W.index_select(0, seq_t).to(dt))
+                return torch.split(G, sizes)
+            per = [tuple(gather(W) for W in t) for t in lv]
+            parts = []
+            for gi, (c, r0, m, a0, a1) in enumerate(groups):
+                lvg = [tuple(Ws[gi] for Ws in t) for t in per]
+                local, sl = e_rank[a0:a1] - r0, slot[a0:a1]
+                buf = torch.zeros(m, c, D, device=src.device, dtype=dt)
+                buf[local, sl] = src[t_sorted[a0:a1]].to(dt)
+                parts.append(experts(lvg, buf)[local, sl])
+            return (parts[0] if len(parts) == 1
+                    else torch.cat(parts)).to(src.dtype)
 
         flat_w = tuple(t for lv_ in levels for t in lv_)
         if self.grad_checkpoint and self.training and torch.is_grad_enabled():
@@ -643,6 +696,25 @@ class PooledMLP(nn.Module):
         out = torch.zeros_like(flat)
         out.index_add_(0, t_sorted, gathered * w_sorted.unsqueeze(-1))
         return out.view(B, T, D)
+
+
+CAP_STEP = 128
+
+
+def _bucket(cap):
+    """
+    The dispatch buffer's capacity, rounded so few distinct sizes occur.
+
+    Powers of two up to CAP_STEP, so a small batch pads by at most 2x of
+    very little; multiples of CAP_STEP above it, so a training chunk pads by
+    at most CAP_STEP rows. 0 and 1 are left as they are: a character being
+    written has cap 1 every time.
+    """
+    if cap <= 1:
+        return cap
+    if cap <= CAP_STEP:
+        return 1 << (cap - 1).bit_length()
+    return -(-cap // CAP_STEP) * CAP_STEP
 
 
 def _mem_frac():

@@ -478,7 +478,7 @@ python tools/bench_hw.py --config configs/strix_halo_large.yaml  # measure befor
 | `ram_tier_on_gpu` | holds the expert pool's RAM tier as device tensors, so paging an expert onto the card is a device-to-device copy rather than a blocking host transfer. System memory *is* the card's memory here |
 | `rocm_aotriton` | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` - the fast SDPA kernels on RDNA 3.5. Without them the cached forward falls back to math attention, which builds the full score matrix at every row |
 | `tunableop` | `PYTORCH_TUNABLEOP_ENABLED=1`. Off in both profiles: the expert dispatch's matmuls change shape every forward, so it re-tunes nearly every call - a held-out pass ran past half an hour on the 8060S |
-| `expandable_segments` | the allocator setting train.py has always used; turn it off if your ROCm build warns it is unsupported |
+| `expandable_segments` | the allocator setting train.py has always used. ROCm on Windows ignores it ("not supported on this platform"), so the profiles turn it off and `minagi/pool.py` rounds the expert dispatch buffer to a few fixed sizes instead - without that, an uncapped run fragmented to 49 GB reserved for 17 GB live and crashed |
 
 Every run prints a `hardware:` line naming the device, backend, whether memory is unified, the budget and where it came from.
 
