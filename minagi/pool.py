@@ -335,6 +335,10 @@ class PooledMLP(nn.Module):
         # ...and the denominator, so the counter reads as a share of the
         # work rather than as a number nobody can scale.
         self.routed = 0
+        # Run only the experts a call actually chose when they are at most
+        # half the card - see the dispatch. Off reproduces the old path, which
+        # the tests compare against.
+        self.subset_dispatch = True
 
     @property
     def pool(self):
@@ -444,7 +448,9 @@ class PooledMLP(nn.Module):
         # measured BEFORE normalisation - afterwards it sums to 1 by
         # construction and carries no information
         with torch.no_grad():
-            kept = float(w.sum(-1).mean())
+            # kept on the device: these feed telemetry only, and reading them
+            # back here was a sync per row of every character
+            kept = w.sum(-1).mean()
             # How many experts the router actually wants: the smallest number
             # covering 90% of its probability mass. If that exceeds k, the
             # router is being forced to discard experts it would have used, and
@@ -494,8 +500,8 @@ class PooledMLP(nn.Module):
             # wants to spread across more experts than k, the pool is too
             # small to express what it is trying to do - that is capacity
             # pressure, and it is visible without waiting for a plateau.
-            p.pressure = 0.9 * float(p.pressure) + 0.1 * (1.0 - kept)
-            p.want_k = 0.9 * float(p.want_k) + 0.1 * float(want)
+            p.pressure = 0.9 * p.pressure + 0.1 * (1.0 - kept)
+            p.want_k = 0.9 * p.want_k + 0.1 * want
         frac = F.one_hot(idx[:, 0], n).float().mean(0)
         self.aux = ((frac * probs.mean(0)).sum() * n
                     + self.z_weight * torch.logsumexp(logits, -1).pow(2).mean())
@@ -511,7 +517,13 @@ class PooledMLP(nn.Module):
         order = torch.argsort(flat_e)
         e_sorted, t_sorted, w_sorted = flat_e[order], tok[order], flat_w[order]
         counts = torch.bincount(e_sorted, minlength=n)
-        cap = int(counts.max().item()) if n else 0
+        # One character's top_k are distinct experts, so each holds at most
+        # one of its assignments: no need to ask the device, which is a sync
+        # per row when a character is being written.
+        if N == 1:
+            cap = 1 if n else 0
+        else:
+            cap = int(counts.max().item()) if n else 0
         if cap == 0:
             return torch.zeros_like(x)
 
@@ -563,6 +575,37 @@ class PooledMLP(nn.Module):
                 w_sorted, slot = w_sorted[keep], slot[keep]
                 cap = limit
 
+        # ONLY THE EXPERTS THAT WERE CHOSEN RUN. The buffer is [n, cap, D] and
+        # every matmul below reads every expert's weights - and casts them to
+        # the compute dtype - whether or not anything was routed to it. A
+        # training chunk of 2,048 characters reaches nearly every expert on
+        # the card, so that costs nothing there. A character being written is
+        # a forward of its own and reaches top_k of them: with 128 on the
+        # card, every row read and cast all 128 to run 8, and writing was
+        # bound by memory bandwidth - 2.9 characters a second on Strix Halo.
+        #
+        # So when at most half the experts are in use, the weights of just
+        # those are gathered first. Half, because the gather copies them in
+        # fp32 before the cast; below that the copy is no larger than the
+        # cast of the whole card it replaces, so peak memory never rises.
+        sub = None
+        if self.subset_dispatch and n > 1:
+            if N == 1:
+                # sorted and distinct already, and the count is known here
+                present = e_sorted
+            else:
+                present = torch.nonzero(counts > 0).squeeze(1)
+            m = int(present.numel())
+            if 0 < m * 2 <= n:
+                remap = torch.full((n,), -1, dtype=torch.long,
+                                   device=flat.device)
+                remap[present] = torch.arange(m, device=flat.device)
+                e_sorted = remap[e_sorted]
+                sub, n = present, m
+
+        def pick(W):
+            return W if sub is None else W.index_select(0, sub)
+
         def run(src, *ws):
             lv = [(ws[i], ws[i + 1], ws[i + 2]) for i in range(0, len(ws), 3)]
             # The slot buffer, and everything computed from it, in the COMPUTE
@@ -577,7 +620,7 @@ class PooledMLP(nn.Module):
             buf = torch.zeros(n, cap, D, device=src.device, dtype=dt)
             buf[e_sorted, slot] = src[t_sorted].to(dt)
             if len(lv) == 1:
-                W1, W3, W2 = lv[0]
+                W1, W3, W2 = (pick(t) for t in lv[0])
                 h = F.silu(torch.bmm(buf, W1.transpose(1, 2).to(buf.dtype))) * \
                     torch.bmm(buf, W3.transpose(1, 2).to(buf.dtype))
                 y = torch.bmm(h, W2.transpose(1, 2).to(buf.dtype))  # [n,cap,D]
@@ -585,7 +628,7 @@ class PooledMLP(nn.Module):
             # deeper experts stack residually, so an expert of any depth can
             # still be added to the mixture without changing its scale
             x = buf
-            for W1, W3, W2 in lv:
+            for W1, W3, W2 in ((pick(a), pick(b), pick(c)) for a, b, c in lv):
                 h = F.silu(torch.bmm(x, W1.transpose(1, 2).to(x.dtype))) * \
                     torch.bmm(x, W3.transpose(1, 2).to(x.dtype))
                 x = x + torch.bmm(h, W2.transpose(1, 2).to(x.dtype))

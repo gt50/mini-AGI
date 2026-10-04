@@ -287,6 +287,10 @@ class PagedPool(nn.Module):
         self.pressure = 0.0
         self.want_k = 0.0
         self.swaps = 0
+        # slot order as a device tensor, rebuilt only when the slots change -
+        # see _slot_index
+        self._slot_key = None
+        self._slot_t = None
         self._opt = None
         self._sites = []          # the call sites routing into this pool
         # THE PRUNE CLOCK: the text count at which each expert was last
@@ -442,24 +446,39 @@ class PagedPool(nn.Module):
         """One row per expert on disk; growth adds rows."""
         return self._n
 
+    def _slot_index(self, device):
+        """
+        The slots' experts as an index tensor on `device`, in slot order.
+
+        Every routing call asks for it several times, once per row of every
+        character, and the slots change only when an expert is loaded. It was
+        rebuilt from the Python list each time: a host-to-device copy per
+        call, which is most of what writing a character cost on an APU. Now
+        it is rebuilt when the list differs from the one it was built from.
+        Callers only read it.
+        """
+        key = tuple(self.slots)
+        if (self._slot_key != key or self._slot_t is None
+                or self._slot_t.device != torch.device(device)):
+            self._slot_t = torch.tensor([max(s, 0) for s in key],
+                                        device=device)
+            self._slot_key = key
+        return self._slot_t
+
     def resident_rows(self):
         """Which router rows the resident experts own, in slot order."""
-        return torch.tensor([max(s, 0) for s in self.slots],
-                            device=self.gate.device)
+        return self._slot_index(self.gate.device)
 
     def n_resident(self):
         return self.resident
 
     def routable_gate(self):
         """Gates of the resident experts, in slot order."""
-        idx = torch.tensor([max(s, 0) for s in self.slots],
-                           device=self.gate.device)
-        return self.gate[idx]
+        return self.gate[self._slot_index(self.gate.device)]
 
     def note_use(self, hit):
         """Routing counts arrive per SLOT; usage is kept per EXPERT."""
-        idx = torch.tensor([max(s, 0) for s in self.slots],
-                           device=self.use.device)
+        idx = self._slot_index(self.use.device)
         self.use.index_add_(0, idx, hit.to(self.use.dtype))
         self.age += 1
 
@@ -609,7 +628,11 @@ class PagedPool(nn.Module):
         if free <= 0:
             return 0
         order = torch.argsort(m, descending=True).tolist()
-        new = [e for e in order if float(m[e]) > 0 and e not in adm][:free]
+        # as a list: indexing the tensor per expert was two torch ops each,
+        # for every expert in the pool at every row of every character -
+        # nearly half the operations writing a character took
+        ml = m.tolist()
+        new = [e for e in order if ml[e] > 0 and e not in adm][:free]
         if not new:
             return 0
         return self._place(new)
@@ -652,8 +675,10 @@ class PagedPool(nn.Module):
         # the least recently used, which is the one least likely to be wanted
         # back
         victims = [s for s, e in enumerate(self.slots) if e < 0 or e not in adm]
+        # read once: indexing the device tensor per slot was a sync per slot
+        seen = self.last_seen.tolist()
         victims.sort(key=lambda s: (self.slots[s] >= 0,
-                                    float(self.last_seen[self.slots[s]])
+                                    seen[self.slots[s]]
                                     if self.slots[s] >= 0 else -1.0))
         plan = list(self.slots)
         for e in new:
@@ -666,8 +691,8 @@ class PagedPool(nn.Module):
                     self.admits[e] += 1
             self._rearrange(plan, here)
             self.swaps += 1
-        for e in new:
-            self.ever[e] = True
+        # one indexed write, not one device write per expert
+        self.ever[torch.tensor(new, device=self.ever.device)] = True
         # THE PRUNE CLOCK: whatever admits an expert resets it
         self.last_seen[torch.tensor(new, device=self.last_seen.device)] = \
             float(self.segments)
