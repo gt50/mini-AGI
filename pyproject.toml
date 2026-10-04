@@ -1,0 +1,27 @@
+[project]
+name = "mini-agi"
+version = "0.1.0"
+description = "A continual-learning byte-level model that pages its experts from disk"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+# torch is deliberately NOT listed: the right wheel depends on the GPU -
+# CUDA from pytorch.org, ROCm for AMD (gfx1151 / Strix Halo from AMD's own
+# index). Installing it from PyPI here would silently replace a ROCm build
+# with a CUDA one. See "Running it" in the README.
+dependencies = [
+    "numpy>=1.24",
+    "pyyaml>=6.0",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+serve = ["flask>=2.3"]
+corpora = ["chess>=1.10", "zstandard>=0.21", "datasets>=2.18", "tokenizers>=0.15"]
+dev = ["pytest>=7.4"]
+
+[tool.setuptools]
+packages = ["minagi", "corpora"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

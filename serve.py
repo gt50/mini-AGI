@@ -30,8 +30,12 @@ import threading
 import time
 
 # see train.py: the allocator reads this once at CUDA init, so it has to be
-# set before torch loads
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# set before torch loads - and `--config` picks the file whose hardware block
+# decides it
+from minagi.config import take_config_flag  # noqa: E402
+from minagi.device import set_env_before_torch  # noqa: E402
+take_config_flag()
+set_env_before_torch()
 
 import torch
 from flask import Flask, Response, jsonify, request
@@ -89,7 +93,7 @@ def load_prime(chars, root="data/train/self-knowledge"):
     names = ([n for n in names if n.startswith("self-")]
              + [n for n in names if not n.startswith("self-")])
     for name in names[:20]:
-        with open(os.path.join(root, name), errors="replace") as f:
+        with open(os.path.join(root, name), errors="replace", encoding="utf-8") as f:
             text = f.read(chars * 3)
         best = ""
         at = text.find(f"{B1}\n")
@@ -108,7 +112,7 @@ def load_prime(chars, root="data/train/self-knowledge"):
 def _manifest(path):
     """As loaded, so a save does not overwrite it with a blank one."""
     try:
-        with open(os.path.join(path, "manifest.json")) as f:
+        with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -133,7 +137,9 @@ def load(weights, device=None, learn=True, lr=3e-4, save_every=8,
         print("[warn] CUDA is full, serving on CPU", file=sys.stderr)
     model.eval()
     STATE.update(model=model, tok=ByteTokenizer(), weights=weights)
+    from minagi.device import banner
     print(f"[loaded] {weights} on {dev}", file=sys.stderr)
+    print(f"[{banner(dev)}]", file=sys.stderr)
 
     # A paged model loads with an EMPTY card - every slot -1. A reply is
     # admitted by its own text's vote, so this does not change a reply; what
@@ -239,6 +245,7 @@ def build_prompt(messages, budget, prime=""):
 def stream(prompt, max_new):
     from minagi.config import get as _g, load as _lc
     from minagi.decode import pick_next
+    from minagi.precision import amp
     from minagi.stream import trim_caches
 
     c = _lc()
@@ -284,7 +291,11 @@ def stream(prompt, max_new):
     for i in range(0, out.shape[1], CHUNK):
         part = out[:, i:i + CHUNK]
         trim_caches(caches, model.cfg.block - part.shape[1])
-        logits = model(part, caches=caches, pos_offset=where(caches))[0]
+        # In the compute dtype training runs in - bf16 by default. Without
+        # it a reply ran fp32 everywhere but the expert dispatch. Entered per
+        # forward rather than around the generator, which yields in between.
+        with amp(device):
+            logits = model(part, caches=caches, pos_offset=where(caches))[0]
 
     cur = out[:, -1:]
     produced = []
@@ -295,7 +306,8 @@ def stream(prompt, max_new):
         loads = getattr(pool, "loads", 0)
         if logits is None:
             trim_caches(caches, model.cfg.block - cur.shape[1])
-            logits = model(cur, caches=caches, pos_offset=where(caches))[0]
+            with amp(device):
+                logits = model(cur, caches=caches, pos_offset=where(caches))[0]
             moved = getattr(pool, "loads", 0) - loads
             if moved:
                 # this character asked for experts that were not on the card;

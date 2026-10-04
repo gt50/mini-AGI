@@ -1,3 +1,21 @@
+# mini-AGI on AMD Strix Halo - A NEW, LARGER MODEL.
+#
+#   python train.py --config configs/strix_halo_large.yaml read --save
+#
+# The model block fixes the shape when weights-strix/ is created, so this is
+# a fresh run: it cannot load the released weights.
+#
+# Larger on the axis Strix Halo is rich in. Memory is ~12x an 8 GB card;
+# compute is about the same. So the pool, the resident set and the reach grow
+# a lot (2x experts at birth, 4x resident, 2x context) and the trunk, which
+# every character pays for at every row, grows modestly (512 -> 768 wide).
+# Rough cost per character is 2-3x the released model's.
+#
+# THESE ARE STARTING NUMBERS. Run tools/bench_hw.py with this config on the
+# machine first; if a step is too slow, d_model and context_end are the
+# knobs that buy the most speed back, resident the one that costs the least
+# to keep.
+#
 # mini-AGI — the settings worth changing.
 #
 # Read when a model is created and every time it reads. Anything not here is
@@ -7,9 +25,9 @@ model:
   # THIS BLOCK BUILDS A MODEL; IT DOES NOT CHANGE ONE. Down as far as the
   # depth rule, these are fixed in the manifest when the weights are created.
   # Editing them later does nothing - the shapes would no longer match.
-  d_model: 512            # width of the trunk
-  n_head: 8               # attention heads
-  d_ff: 1408              # the trunk's own feed-forward
+  d_model: 768            # width of the trunk
+  n_head: 12              # attention heads (64 per head, as before)
+  d_ff: 2048              # the trunk's own feed-forward
   n_prelude: 2            # dense blocks before the recurrent core; run once
   n_recur: 1              # blocks per row
   n_coda: 0               # readout blocks after the last row
@@ -43,7 +61,7 @@ model:
   # and grows only when the model is still gaining from the far end of what
   # it has; context_end is the ceiling and binds at load and at every growth.
   context_start: 2048     # where a fresh model begins
-  context_end: 4096       # and the furthest it may ever reach
+  context_end: 8192      # rotary, so the existing model can extend into it
 
   context_step: 1                     # characters added per growth
   context_grow_every_chars: 100_000   # characters between growths
@@ -54,7 +72,7 @@ pool:
   # experts, width, depth and top_k are fixed in the manifest, like the model
   # block. resident, ram_cache and capacity_factor are run-time and can be
   # changed freely.
-  experts: 64             # how many exist at the start; it grows from here
+  experts: 128            # how many exist at the start; it grows from here
   width: 2048             # hidden units in one expert
   depth: 1                # SwiGLU blocks stacked inside one expert
   top_k: 8                # how many one character routes through
@@ -71,9 +89,12 @@ pool:
   #
   # Three tiers: disk holds every expert, RAM caches the recently wanted,
   # VRAM holds what the current forward admitted. Only VRAM is scarce.
-  resident: 32            # experts one forward may use - the card's slots, each
+  resident: 128           # experts one forward may use
+                          # Changes routing, not only memory: a forward is
+                          # admitted more of what its text asks for
                           # holding weights, gradient and Adam's moments
-  ram_cache: 96           # RAM - experts kept in system memory
+  ram_cache: 0            # 0 = every expert stays in the tier, which here
+                          # is device memory: disk is read once per expert
 
   capacity_factor: 1.5    # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
@@ -148,7 +169,7 @@ growth:
   dying_frac_max: 0.35    # stop growing once this share of the pool is dying
 
   # FITS.
-  max_in_flight: 50       # experts allowed inside their trial at once
+  max_in_flight: 100      # experts allowed inside their trial at once
 
   # EARNING. Of the experts past their trial and still young, this share must
   # have earned a gate.
@@ -156,8 +177,8 @@ growth:
   recent_mult: 4.0        # "still young" is age < this x the trial
 
   # ROOM. An expert is 25.2 MB, so 10 GB is about 397 of them.
-  max_disk_gb: 10.0       # ceiling on the pool on disk. 0 for no limit
-  mem_frac: 0.95          # refuse to grow past this share of the card
+  max_disk_gb: 200.0      # an expert is ~38 MB at this width
+  mem_frac: 0.85          # of hardware.gpu_mem_gb; leaves the OS its share
 
   birth_gate: 0.001       # gate a new expert starts at - a scale, not a
                           # verdict. Small so it cannot shout before it earns
@@ -173,7 +194,7 @@ prune:
 data:
   train: data/train
   held_out: data/val
-  weights: weights        # created on the first run if it is not there
+  weights: weights-strix  # a new model gets its own directory
 
   shuffle_seed: 0         # which file and which offset each window comes from
 
@@ -197,16 +218,21 @@ plots:
                           # covers, counted back from wherever reading has got
 
 hardware:
-  # What the machine is, where the code cannot tell for itself - read by
-  # minagi/device.py. Every key is optional; left out, a discrete NVIDIA card
-  # behaves exactly as it always has. See configs/strix_halo.yaml for an APU.
+  # AMD Ryzen AI Max (Strix Halo): Radeon 8060S, gfx1151, RDNA 3.5, sharing
+  # up to 128 GB of LPDDR5X with the CPU at ~256 GB/s.
   #
-  # gpu_mem_gb: 8          # the budget growth's ROOM brake measures against.
-  #                        # Unset, the card's reported size. Set it on an APU,
-  #                        # where the reported size is the firmware carve-out
-  # unified: false         # CPU and GPU share memory. Detected for gfx1150/1/2
-  # ram_tier_on_gpu: false # hold the expert RAM tier on the device. Defaults
-  #                        # to `unified`
-  # expandable_segments: true  # PYTORCH_{CUDA,HIP}_ALLOC_CONF
-  # rocm_aotriton: false   # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-  # tunableop: false       # PYTORCH_TUNABLEOP_ENABLED=1, results in runs/
+  # SET THIS to what the GPU may actually use on your machine:
+  #   Windows - the Variable Graphics Memory set in AMD Software (e.g. 96)
+  #   Linux   - the GTT limit the kernel allows (ttm.pages_limit), less
+  #             headroom for the OS; or the BIOS UMA size if you set it large
+  # torch reports the firmware carve-out as the card's size, which on an APU
+  # says little about what can be allocated, so growth measures against this.
+  gpu_mem_gb: 96
+  unified: true
+  ram_tier_on_gpu: true      # the expert RAM tier lives on the device: a
+                             # page-in is a device-to-device copy
+  expandable_segments: true  # turn off if your ROCm build warns it is
+                             # unsupported (some Windows builds)
+  rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
+                             # 4k window builds its whole T x T scores per row
+  tunableop: true            # tune each GEMM shape once, results in runs/

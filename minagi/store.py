@@ -142,7 +142,7 @@ def save(model, path, step=None, val=None, opt=None, cfg=None, verbose=False,
         "removed_expert_files": removed,
     }
     tmp = os.path.join(path, "manifest.json.tmp")
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     os.replace(tmp, os.path.join(path, "manifest.json"))
     if verbose:
@@ -248,7 +248,7 @@ def _save_paged(model, pool, path, step, val, opt, cfg, verbose, extra=None):
                 "experts": entries, "total_bytes": int(total)}
     manifest.update(extra or {})       # where the reader had got to
     tmp = os.path.join(path, "manifest.json.tmp")
-    with open(tmp, "w") as f:
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=1)
     os.replace(tmp, os.path.join(path, "manifest.json"))
     if verbose:
@@ -295,31 +295,33 @@ def _save_optim(opt, model, path):
 def load(model, path, opt=None, device=None, strict=False, verbose=False):
     """Rebuild a model's tensors from the directory."""
     device = device or next(model.parameters()).device
-    with open(os.path.join(path, "manifest.json")) as f:
+    with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
     sd = {}
-    core = np.load(os.path.join(path, "core.npz"))
-    routers = np.load(os.path.join(path, "routers.npz"))
-    for k in core.files:
-        sd[k] = torch.from_numpy(core[k])
-    for k in routers.files:
-        sd[k] = torch.from_numpy(routers[k])
+    # every npz is opened in `with`: Windows cannot replace a file that is
+    # still open, and the next save replaces all of them
+    with np.load(os.path.join(path, "core.npz")) as core:
+        for k in core.files:
+            sd[k] = torch.from_numpy(core[k])
+    with np.load(os.path.join(path, "routers.npz")) as routers:
+        for k in routers.files:
+            sd[k] = torch.from_numpy(routers[k])
     d_model, d_ff = man["d_model"], man["d_ff"]
     n1 = d_ff * d_model
     for e in man["experts"]:
         f = os.path.join(path, EXPERTS, e["file"])
         i = e["id"]
         if f.endswith(".npz"):
-            z = np.load(f)
-            for leaf in z.files:
-                if leaf.endswith(("_m", "_v")):
-                    continue                       # optimiser state, not weights
-                if leaf.startswith("b") and "_" in leaf:
-                    b, nm = leaf[1:].split("_", 1)
-                    key = f"pool.experts.{i}.blocks.{b}.{nm}.weight"
-                else:
-                    key = f"pool.experts.{i}.{leaf}.weight"
-                sd[key] = torch.from_numpy(z[leaf])
+            with np.load(f) as z:
+                for leaf in z.files:
+                    if leaf.endswith(("_m", "_v")):
+                        continue                       # optimiser state, not weights
+                    if leaf.startswith("b") and "_" in leaf:
+                        b, nm = leaf[1:].split("_", 1)
+                        key = f"pool.experts.{i}.blocks.{b}.{nm}.weight"
+                    else:
+                        key = f"pool.experts.{i}.{leaf}.weight"
+                    sd[key] = torch.from_numpy(z[leaf])
         else:
             # the older flat layout, before moments moved into the file
             flat = torch.from_numpy(np.load(f))
@@ -342,27 +344,27 @@ def _load_optim(opt, model, path):
     f = os.path.join(path, "optim.npz")
     if not os.path.exists(f):
         return
-    z = np.load(f)
-    name_of = {id(p): n for n, p in model.named_parameters()}
-    for group in opt.param_groups:
-        for p in group["params"]:
-            n = name_of.get(id(p))
-            if n is None or (n + "|m") not in z.files:
-                continue
-            m = unpack_bf16(z[n + "|m"])
-            v = unpack_bf16(z[n + "|v"])
-            # a tensor that changed shape since the moments were written - the
-            # embedding after a vocabulary extension, an expert after growth -
-            # has to start with fresh moments rather than mismatched ones
-            if m.shape != p.shape or v.shape != p.shape:
-                continue
-            st = opt.state[p]
-            st["exp_avg"] = m.to(device=p.device, dtype=p.dtype)
-            st["exp_avg_sq"] = v.to(device=p.device, dtype=p.dtype)
-            if (n + "|t") in z.files:
-                # fused AdamW requires the step counter on the same device as
-                # the parameter, not on the CPU where it was just loaded
-                st["step"] = torch.tensor(float(z[n + "|t"]), device=p.device)
+    with np.load(f) as z:
+        name_of = {id(p): n for n, p in model.named_parameters()}
+        for group in opt.param_groups:
+            for p in group["params"]:
+                n = name_of.get(id(p))
+                if n is None or (n + "|m") not in z.files:
+                    continue
+                m = unpack_bf16(z[n + "|m"])
+                v = unpack_bf16(z[n + "|v"])
+                # a tensor that changed shape since the moments were written - the
+                # embedding after a vocabulary extension, an expert after growth -
+                # has to start with fresh moments rather than mismatched ones
+                if m.shape != p.shape or v.shape != p.shape:
+                    continue
+                st = opt.state[p]
+                st["exp_avg"] = m.to(device=p.device, dtype=p.dtype)
+                st["exp_avg_sq"] = v.to(device=p.device, dtype=p.dtype)
+                if (n + "|t") in z.files:
+                    # fused AdamW requires the step counter on the same device as
+                    # the parameter, not on the CPU where it was just loaded
+                    st["step"] = torch.tensor(float(z[n + "|t"]), device=p.device)
 
 
 def _load_expert_moments(opt, model, path):
@@ -387,10 +389,15 @@ def _load_expert_moments(opt, model, path):
             st = opt.state[p]
             st["exp_avg"] = m.to(device=p.device, dtype=p.dtype)
             st["exp_avg_sq"] = v.to(device=p.device, dtype=p.dtype)
+    # Windows cannot replace a file that is still open, and the next save
+    # replaces every one of these
+    for z in cache.values():
+        if z is not None:
+            z.close()
 
 
 def summarise(path):
-    with open(os.path.join(path, "manifest.json")) as f:
+    with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
     ne = len([f for f in os.listdir(os.path.join(path, EXPERTS))
               if f.endswith((".npy", ".npz"))])
@@ -443,6 +450,6 @@ def best_val(path):
     f = os.path.join(path, "manifest.json")
     if not os.path.exists(f):
         return float("inf")
-    with open(f) as fh:
+    with open(f, encoding="utf-8") as fh:
         v = json.load(fh).get("val")
     return float(v) if v is not None else float("inf")

@@ -424,7 +424,7 @@ The right panel shows which subjects are still moving. reasoning, code, stories,
 
 ## Running it
 
-1. Make sure you have a CUDA-capable GPU with at least 8 GB of VRAM, and Python 3.10 or newer. The reference machine is an RTX 3070 Laptop GPU with 8 GB.
+1. Make sure you have a GPU with at least 8 GB of memory - a CUDA card, or an AMD GPU with a ROCm build of PyTorch (see [AMD and Strix Halo](#amd-and-strix-halo)) - and Python 3.10 or newer. The reference machine is an RTX 3070 Laptop GPU with 8 GB.
 2. Clone the repository:
     ```bash
     git clone <repository-url>
@@ -438,6 +438,8 @@ The right panel shows which subjects are still moving. reasoning, code, stories,
     pip install scipy                              # a few of the analysis tools
     ```
     PyTorch has to match your CUDA version - see [the PyTorch install page](https://pytorch.org/get-started/locally/). The reference environment is torch 2.6.0+cu124 with numpy 1.24.4. Only the first line is needed to train.
+
+    Or, with torch already installed for your GPU, `pip install -e .[serve,corpora]` installs everything else from `pyproject.toml`, which leaves torch alone on purpose.
 4. Build the corpus. One command downloads the four public datasets and generates the other four lanes:
     ```bash
     python3 -m corpora all                  # all eight subjects, a few GB
@@ -456,6 +458,41 @@ The right panel shows which subjects are still moving. reasoning, code, stories,
     ```
 
 The run writes a sample log, redraws its graphs as it goes, and checkpoints every few minutes. It is meant to be left alone for days.
+
+### AMD and Strix Halo
+
+ROCm builds of PyTorch answer to the same `torch.cuda` namespace, so nothing in the code is vendor-specific and `--device cuda` is still the flag. What an AMD APU such as the Ryzen AI Max (Strix Halo: Radeon 8060S, gfx1151, up to 128 GB of shared LPDDR5X) needs is a profile, because the hardware differs in ways the code cannot see:
+
+```bash
+python train.py --config configs/strix_halo.yaml read --save     # continue the released model
+python train.py --config configs/strix_halo_large.yaml read --save   # a new, larger one
+python serve.py --config configs/strix_halo.yaml
+python tools/bench_hw.py --config configs/strix_halo_large.yaml  # measure before committing to a run
+```
+
+`--config` (or `MINAGI_CONFIG`) replaces `config.yaml` for every reader in the process. Both profiles set a `hardware:` block, read by [`minagi/device.py`](minagi/device.py):
+
+| key | what it does |
+|---|---|
+| `gpu_mem_gb` | the budget growth's ROOM brake measures against. **Set it to what the GPU may really use** - the Variable Graphics Memory in AMD Software on Windows, the GTT limit on Linux. torch reports the firmware carve-out as the card's size, which on an APU says little |
+| `ram_tier_on_gpu` | holds the expert pool's RAM tier as device tensors, so paging an expert onto the card is a device-to-device copy rather than a blocking host transfer. System memory *is* the card's memory here |
+| `rocm_aotriton` | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` - the fast SDPA kernels on RDNA 3.5. Without them the cached forward falls back to math attention, which builds the full score matrix at every row |
+| `tunableop` | `PYTORCH_TUNABLEOP_ENABLED=1` - tunes the expert dispatch's batched matmuls once and keeps the results in `runs/` |
+| `expandable_segments` | the allocator setting train.py has always used; turn it off if your ROCm build warns it is unsupported |
+
+Every run prints a `hardware:` line naming the device, backend, whether memory is unified, the budget and where it came from.
+
+**Install.** Stock PyTorch wheels do not cover gfx1151. AMD publishes builds for it, for Linux and Windows, from its own index:
+
+```bash
+pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch
+```
+
+Then `pip install -e .[serve,corpora]` for the rest. A later `pip install -U` can pull a CUDA torch from PyPI over the ROCm one, so re-run the line above after any upgrade. Check with `python -c "import torch; print(torch.version.hip, torch.cuda.get_device_properties(0))"`, which should name gfx1151.
+
+**Memory.** On Linux, a small BIOS carve-out with a large GTT allowance is the usual setup - raise the TTM limit on the kernel command line (`ttm.pages_limit` counts 4 KiB pages: 27648000 is about 105 GiB) and set `gpu_mem_gb` a little below it. On Windows, set Variable Graphics Memory in AMD Software and set `gpu_mem_gb` to match.
+
+**What to expect.** The 8060S is in the same compute class as the reference RTX 3070 Laptop, with less memory bandwidth, so characters per second will be similar or lower - not higher. What it has is memory, roughly twelve times an 8 GB card's, and the profiles spend it on the axis this model is built around: `configs/strix_halo.yaml` keeps the released model's shape and gives it 64 experts per forward instead of 32, the whole pool in device memory, an 8k reach and a 100 GB disk ceiling; `configs/strix_halo_large.yaml` starts a new model with twice the experts at birth, four times the resident set and a trunk 768 wide. Raising `resident` changes routing, not only memory - a forward is admitted more of what its text asks for - so compare held-out loss before and after rather than assuming it is free. Its numbers are starting points: run `tools/bench_hw.py` on the machine first.
 
 ### Everything else
 

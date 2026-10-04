@@ -1,3 +1,18 @@
+# mini-AGI on AMD Strix Halo - CONTINUING THE EXISTING MODEL.
+#
+#   python train.py --config configs/strix_halo.yaml read --save
+#   python serve.py --config configs/strix_halo.yaml
+#
+# The model block below is the released model's shape, so this profile
+# continues weights/ as they are (including the Hugging Face snapshots). Only
+# run-time settings change: more experts per forward, the whole pool held in
+# device memory, a longer reach, a larger disk ceiling. For a NEW, larger
+# model see configs/strix_halo_large.yaml.
+#
+# Expect characters per second close to an RTX 3070 Laptop's, not above it:
+# the 8060S is in the same compute class with less memory bandwidth. What it
+# has is memory, and this profile spends it.
+#
 # mini-AGI — the settings worth changing.
 #
 # Read when a model is created and every time it reads. Anything not here is
@@ -43,7 +58,7 @@ model:
   # and grows only when the model is still gaining from the far end of what
   # it has; context_end is the ceiling and binds at load and at every growth.
   context_start: 2048     # where a fresh model begins
-  context_end: 4096       # and the furthest it may ever reach
+  context_end: 8192      # rotary, so the existing model can extend into it
 
   context_step: 1                     # characters added per growth
   context_grow_every_chars: 100_000   # characters between growths
@@ -71,9 +86,12 @@ pool:
   #
   # Three tiers: disk holds every expert, RAM caches the recently wanted,
   # VRAM holds what the current forward admitted. Only VRAM is scarce.
-  resident: 32            # experts one forward may use - the card's slots, each
+  resident: 64            # experts one forward may use - TWICE the 8 GB card's.
+                          # Changes routing, not only memory: a forward is
+                          # admitted more of what its text asks for
                           # holding weights, gradient and Adam's moments
-  ram_cache: 96           # RAM - experts kept in system memory
+  ram_cache: 0            # 0 = every expert stays in the tier, which here
+                          # is device memory: disk is read once per expert
 
   capacity_factor: 1.5    # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
@@ -148,7 +166,7 @@ growth:
   dying_frac_max: 0.35    # stop growing once this share of the pool is dying
 
   # FITS.
-  max_in_flight: 50       # experts allowed inside their trial at once
+  max_in_flight: 100      # experts allowed inside their trial at once
 
   # EARNING. Of the experts past their trial and still young, this share must
   # have earned a gate.
@@ -156,8 +174,8 @@ growth:
   recent_mult: 4.0        # "still young" is age < this x the trial
 
   # ROOM. An expert is 25.2 MB, so 10 GB is about 397 of them.
-  max_disk_gb: 10.0       # ceiling on the pool on disk. 0 for no limit
-  mem_frac: 0.95          # refuse to grow past this share of the card
+  max_disk_gb: 100.0      # ~4,000 experts at 25.2 MB
+  mem_frac: 0.85          # of hardware.gpu_mem_gb; leaves the OS its share
 
   birth_gate: 0.001       # gate a new expert starts at - a scale, not a
                           # verdict. Small so it cannot shout before it earns
@@ -197,16 +215,21 @@ plots:
                           # covers, counted back from wherever reading has got
 
 hardware:
-  # What the machine is, where the code cannot tell for itself - read by
-  # minagi/device.py. Every key is optional; left out, a discrete NVIDIA card
-  # behaves exactly as it always has. See configs/strix_halo.yaml for an APU.
+  # AMD Ryzen AI Max (Strix Halo): Radeon 8060S, gfx1151, RDNA 3.5, sharing
+  # up to 128 GB of LPDDR5X with the CPU at ~256 GB/s.
   #
-  # gpu_mem_gb: 8          # the budget growth's ROOM brake measures against.
-  #                        # Unset, the card's reported size. Set it on an APU,
-  #                        # where the reported size is the firmware carve-out
-  # unified: false         # CPU and GPU share memory. Detected for gfx1150/1/2
-  # ram_tier_on_gpu: false # hold the expert RAM tier on the device. Defaults
-  #                        # to `unified`
-  # expandable_segments: true  # PYTORCH_{CUDA,HIP}_ALLOC_CONF
-  # rocm_aotriton: false   # TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1
-  # tunableop: false       # PYTORCH_TUNABLEOP_ENABLED=1, results in runs/
+  # SET THIS to what the GPU may actually use on your machine:
+  #   Windows - the Variable Graphics Memory set in AMD Software (e.g. 96)
+  #   Linux   - the GTT limit the kernel allows (ttm.pages_limit), less
+  #             headroom for the OS; or the BIOS UMA size if you set it large
+  # torch reports the firmware carve-out as the card's size, which on an APU
+  # says little about what can be allocated, so growth measures against this.
+  gpu_mem_gb: 96
+  unified: true
+  ram_tier_on_gpu: true      # the expert RAM tier lives on the device: a
+                             # page-in is a device-to-device copy
+  expandable_segments: true  # turn off if your ROCm build warns it is
+                             # unsupported (some Windows builds)
+  rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
+                             # 4k window builds its whole T x T scores per row
+  tunableop: true            # tune each GEMM shape once, results in runs/

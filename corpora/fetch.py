@@ -103,7 +103,7 @@ def main():
         sub = where if where == a.held_out else os.path.join(
             where, f"{idx // a.shard:04d}")
         os.makedirs(sub, exist_ok=True)
-        with open(os.path.join(sub, f"part-{idx:06d}.txt"), "w") as f:
+        with open(os.path.join(sub, f"part-{idx:06d}.txt"), "w", encoding="utf-8") as f:
             f.write(text)
         chars += len(text)
         buf.clear()

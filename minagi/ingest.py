@@ -94,7 +94,7 @@ def collect(paths, follow_symlinks=False, cache="runs/corpus_index.json"):
     held = {}
     if cache and os.path.exists(cache):
         try:
-            with open(cache) as f:
+            with open(cache, encoding="utf-8") as f:
                 got = json.load(f)
             held = got.get("entries") or {}
             if sig in held:
@@ -114,7 +114,7 @@ def collect(paths, follow_symlinks=False, cache="runs/corpus_index.json"):
                     del held[k]
             os.makedirs(os.path.dirname(cache) or ".", exist_ok=True)
             tmp = cache + ".tmp"
-            with open(tmp, "w") as f:
+            with open(tmp, "w", encoding="utf-8") as f:
                 json.dump({"entries": held}, f)
             os.replace(tmp, cache)
         except OSError:

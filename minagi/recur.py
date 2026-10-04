@@ -491,19 +491,13 @@ def _load_dir(path, device, paged=None, read_only=False):
     import os
     import sys
     from . import store as weights_store
-    with open(os.path.join(path, "manifest.json")) as f:
+    with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
         man = json.load(f)
     if paged is None:
         paged = bool(man.get("paged"))
     if paged:
-        # build_paged lives in train.py; a caller in another directory (the
-        # film's captures run from video/) needs the repo root on the path
-        _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        if _root not in sys.path:
-            sys.path.insert(0, _root)
-        import train as _train
-        m, cfg, pool, man2 = _train.build_paged(path, device,
-                                                read_only=read_only)
+        from .build import build_paged
+        m, cfg, pool, man2 = build_paged(path, device, read_only=read_only)
         return m, {"cfg": cfg.__dict__, "step": man2.get("step"),
                    "val": man2.get("val")}
     cfg = RecurConfig(**{k: v for k, v in (man.get("cfg") or {}).items()

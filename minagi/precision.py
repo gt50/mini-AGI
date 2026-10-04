@@ -85,7 +85,7 @@ def pack_bf16(t):
     """A float tensor as int16 carrying bfloat16 bits, for storage."""
     if not torch.is_tensor(t):
         t = torch.as_tensor(t)
-    return t.to(torch.bfloat16).view(torch.int16).numpy()
+    return t.detach().to("cpu", torch.bfloat16).view(torch.int16).numpy()
 
 
 def unpack_bf16(a):

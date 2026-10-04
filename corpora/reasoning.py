@@ -106,12 +106,12 @@ def main():
         # has a held-out score like every other one
         if n < a.hold:
             os.makedirs(a.held_out, exist_ok=True)
-            with open(os.path.join(a.held_out, f"trace-{n:06d}.txt"), "w") as f:
+            with open(os.path.join(a.held_out, f"trace-{n:06d}.txt"), "w", encoding="utf-8") as f:
                 f.write(text)
         else:
             sub = os.path.join(a.out, f"{(n - a.hold) // a.shard:04d}")
             os.makedirs(sub, exist_ok=True)
-            with open(os.path.join(sub, f"trace-{n:06d}.txt"), "w") as f:
+            with open(os.path.join(sub, f"trace-{n:06d}.txt"), "w", encoding="utf-8") as f:
                 f.write(text)
         n += 1
         chars += len(text)

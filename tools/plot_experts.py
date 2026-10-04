@@ -47,7 +47,7 @@ def cfg(root):
            "resident": 32}
     try:
         import yaml
-        c = yaml.safe_load(open(os.path.join(root, "config.yaml")))
+        c = yaml.safe_load(open(os.path.join(root, "config.yaml"), encoding="utf-8"))
         out["survival_chars"] = int(str(c["prune"]["survival_chars"]).replace("_", ""))
         out["dying_at"] = float(c["prune"].get("dying_at", 0.75))
         out["chunk"] = int(c["training"]["chunk"])
@@ -61,7 +61,7 @@ def cfg(root):
 def history(path):
     rows = []
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             for line in f:
                 try:
                     d = json.loads(line)
@@ -158,7 +158,7 @@ def main():
 
     rows = history(a.history)
     try:
-        man = json.load(open(os.path.join(a.weights, "manifest.json")))
+        man = json.load(open(os.path.join(a.weights, "manifest.json"), encoding="utf-8"))
     except OSError:
         print(f"  no checkpoint at {a.weights}")
         return 1

@@ -31,7 +31,7 @@ try:                                                        # noqa: E402
     import yaml
     _c = yaml.safe_load(open(os.path.join(
         os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-        "config.yaml")))
+        "config.yaml"), encoding="utf-8"))
     DYING_AT = float(_c["prune"].get("dying_at", 0.75))
     SURVIVAL_CHARS = int(str(_c["prune"].get("survival_chars", 0)).replace("_", ""))
     CHUNK = int(_c["training"].get("chunk", 1536))
@@ -73,7 +73,7 @@ def _dead_pct(r):
 
 
 def parse(path):
-    txt = open(path, errors="ignore").read()
+    txt = open(path, errors="ignore", encoding="utf-8").read()
     rows = []
     for m in HEAD.finditer(txt):
         blk = txt[m.end():m.end() + 700]
@@ -237,7 +237,7 @@ def main():
     p = ax[1][1]
     ph = []
     if os.path.exists(a.pool_log):
-        with open(a.pool_log) as f:
+        with open(a.pool_log, encoding="utf-8") as f:
             for line in f:
                 if line.strip():
                     try:

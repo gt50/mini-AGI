@@ -369,7 +369,7 @@ def main():
            "domains": doms, "baseline": {k: base[k] for k in doms},
            "rows": rows}
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    with open(a.out, "w") as f:
+    with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
     print(f"\n  -> {a.out}")
 
