@@ -235,4 +235,9 @@ hardware:
                              # unsupported (some Windows builds)
   rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
                              # 4k window builds its whole T x T scores per row
-  tunableop: true            # tune each GEMM shape once, results in runs/
+  tunableop: false           # OFF on purpose. The expert dispatch's batched
+                             # matmuls change shape with every forward - an
+                             # expert's batch is however many characters chose
+                             # it - so TunableOp re-tunes nearly every call:
+                             # measured, a held-out pass that should take
+                             # minutes ran past half an hour, 2,000+ shapes in

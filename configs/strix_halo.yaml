@@ -5,9 +5,8 @@
 #
 # The model block below is the released model's shape, so this profile
 # continues weights/ as they are (including the Hugging Face snapshots). Only
-# run-time settings change: more experts per forward, the whole pool held in
-# device memory, a longer reach, a larger disk ceiling. For a NEW, larger
-# model see configs/strix_halo_large.yaml.
+# run-time settings change: the whole pool held in device memory and a larger
+# disk ceiling. For a NEW, larger model see configs/strix_halo_large.yaml.
 #
 # Expect characters per second close to an RTX 3070 Laptop's, not above it:
 # the 8060S is in the same compute class with less memory bandwidth. What it
@@ -58,7 +57,11 @@ model:
   # and grows only when the model is still gaining from the far end of what
   # it has; context_end is the ceiling and binds at load and at every growth.
   context_start: 2048     # where a fresh model begins
-  context_end: 8192      # rotary, so the existing model can extend into it
+  context_end: 4096      # the released model's. NOT raised: held-out is read
+                          # at this ceiling, and at 8192 the released weights
+                          # scored 1.66 nats against ~0.6 - positions past
+                          # 4,096 are ones it has never been trained on.
+                          # Raise it only alongside training that ramps into it
 
   context_step: 1                     # characters added per growth
   context_grow_every_chars: 100_000   # characters between growths
@@ -86,10 +89,12 @@ pool:
   #
   # Three tiers: disk holds every expert, RAM caches the recently wanted,
   # VRAM holds what the current forward admitted. Only VRAM is scarce.
-  resident: 64            # experts one forward may use - TWICE the 8 GB card's.
-                          # Changes routing, not only memory: a forward is
-                          # admitted more of what its text asks for
-                          # holding weights, gradient and Adam's moments
+  resident: 32            # experts one forward may use - the released model's
+                          # own. NOT raised here: measured on the released
+                          # weights, 64 took held-out chat from 0.60 to 0.92
+                          # and code from 0.71 to 1.19 nats, because the model
+                          # learned to choose within 32. A larger card is for a
+                          # model trained with it - see strix_halo_large.yaml
   ram_cache: 0            # 0 = every expert stays in the tier, which here
                           # is device memory: disk is read once per expert
 
@@ -232,4 +237,9 @@ hardware:
                              # unsupported (some Windows builds)
   rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
                              # 4k window builds its whole T x T scores per row
-  tunableop: true            # tune each GEMM shape once, results in runs/
+  tunableop: false           # OFF on purpose. The expert dispatch's batched
+                             # matmuls change shape with every forward - an
+                             # expert's batch is however many characters chose
+                             # it - so TunableOp re-tunes nearly every call:
+                             # measured, a held-out pass that should take
+                             # minutes ran past half an hour, 2,000+ shapes in
