@@ -28,3 +28,6 @@ venv/
 .idea/
 .pytest_cache/
 *.egg-info/
+
+# other weights directories: weights-strix/ (strix_halo_large.yaml), backups
+weights-*/

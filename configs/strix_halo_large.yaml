@@ -221,12 +221,10 @@ hardware:
   # AMD Ryzen AI Max (Strix Halo): Radeon 8060S, gfx1151, RDNA 3.5, sharing
   # up to 128 GB of LPDDR5X with the CPU at ~256 GB/s.
   #
-  # SET THIS to what the GPU may actually use on your machine:
-  #   Windows - the Variable Graphics Memory set in AMD Software (e.g. 96)
-  #   Linux   - the GTT limit the kernel allows (ttm.pages_limit), less
-  #             headroom for the OS; or the BIOS UMA size if you set it large
-  # torch reports the firmware carve-out as the card's size, which on an APU
-  # says little about what can be allocated, so growth measures against this.
+  # SET THIS to what the GPU may actually use on your machine: the Variable
+  # Graphics Memory set in AMD Software (e.g. 96). On an APU the size torch
+  # reports need not match it - on the test machine it reported 99.7 GB while
+  # Windows kept 63.6 GB for itself - so growth measures against this.
   gpu_mem_gb: 96
   unified: true
   ram_tier_on_gpu: true      # the expert RAM tier lives on the device: a
@@ -235,4 +233,9 @@ hardware:
                              # unsupported (some Windows builds)
   rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
                              # 4k window builds its whole T x T scores per row
-  tunableop: true            # tune each GEMM shape once, results in runs/
+  tunableop: false           # OFF on purpose. The expert dispatch's batched
+                             # matmuls change shape with every forward - an
+                             # expert's batch is however many characters chose
+                             # it - so TunableOp re-tunes nearly every call:
+                             # measured, a held-out pass that should take
+                             # minutes ran past half an hour, 2,000+ shapes in

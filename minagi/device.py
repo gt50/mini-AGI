@@ -7,10 +7,10 @@ know which vendor it is on. What does need to know:
 
   - the memory budget. Growth refuses to add an expert once the peak this
     process allocated passes a share of the card. A discrete card reports its
-    size honestly; an APU such as Strix Halo (gfx1151) reports whatever the
-    firmware carved out, which can be 512 MB or 96 GB on the same machine and
-    says nothing about the GTT memory the driver will also hand out. So the
-    budget can be stated, and a stated budget wins.
+    size honestly; on an APU such as Strix Halo (gfx1151) the size depends on
+    how much system memory the driver lends the GPU, and what torch reports
+    need not match what can really be allocated. So the budget can be stated,
+    and a stated budget wins.
   - whether CPU and GPU share memory. When they do, the RAM tier of the
     expert pool can sit on the device itself, and paging an expert onto the
     card becomes a device-to-device copy instead of a blocking host transfer.

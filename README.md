@@ -474,15 +474,15 @@ python tools/bench_hw.py --config configs/strix_halo_large.yaml  # measure befor
 
 | key | what it does |
 |---|---|
-| `gpu_mem_gb` | the budget growth's ROOM brake measures against. **Set it to what the GPU may really use** - the Variable Graphics Memory in AMD Software on Windows, the GTT limit on Linux. torch reports the firmware carve-out as the card's size, which on an APU says little |
+| `gpu_mem_gb` | the budget growth's ROOM brake measures against. **Set it to what the GPU may really use** - the Variable Graphics Memory set in AMD Software. On an APU the size torch reports need not match it |
 | `ram_tier_on_gpu` | holds the expert pool's RAM tier as device tensors, so paging an expert onto the card is a device-to-device copy rather than a blocking host transfer. System memory *is* the card's memory here |
 | `rocm_aotriton` | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` - the fast SDPA kernels on RDNA 3.5. Without them the cached forward falls back to math attention, which builds the full score matrix at every row |
-| `tunableop` | `PYTORCH_TUNABLEOP_ENABLED=1` - tunes the expert dispatch's batched matmuls once and keeps the results in `runs/` |
+| `tunableop` | `PYTORCH_TUNABLEOP_ENABLED=1`. Off in both profiles: the expert dispatch's matmuls change shape every forward, so it re-tunes nearly every call - a held-out pass ran past half an hour on the 8060S |
 | `expandable_segments` | the allocator setting train.py has always used; turn it off if your ROCm build warns it is unsupported |
 
 Every run prints a `hardware:` line naming the device, backend, whether memory is unified, the budget and where it came from.
 
-**Install.** Stock PyTorch wheels do not cover gfx1151. AMD publishes builds for it, for Linux and Windows, from its own index:
+**Install.** Stock PyTorch wheels do not cover gfx1151. AMD publishes Windows builds for it from its own index:
 
 ```bash
 pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch
@@ -490,9 +490,18 @@ pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch
 
 Then `pip install -e .[serve,corpora]` for the rest. A later `pip install -U` can pull a CUDA torch from PyPI over the ROCm one, so re-run the line above after any upgrade. Check with `python -c "import torch; print(torch.version.hip, torch.cuda.get_device_properties(0))"`, which should name gfx1151.
 
-**Memory.** On Linux, a small BIOS carve-out with a large GTT allowance is the usual setup - raise the TTM limit on the kernel command line (`ttm.pages_limit` counts 4 KiB pages: 27648000 is about 105 GiB) and set `gpu_mem_gb` a little below it. On Windows, set Variable Graphics Memory in AMD Software and set `gpu_mem_gb` to match.
+**Memory.** Set Variable Graphics Memory in AMD Software and set `gpu_mem_gb` to match. This port is tested on Windows only.
 
-**What to expect.** The 8060S is in the same compute class as the reference RTX 3070 Laptop, with less memory bandwidth, so characters per second will be similar or lower - not higher. What it has is memory, roughly twelve times an 8 GB card's, and the profiles spend it on the axis this model is built around: `configs/strix_halo.yaml` keeps the released model's shape and gives it 64 experts per forward instead of 32, the whole pool in device memory, an 8k reach and a 100 GB disk ceiling; `configs/strix_halo_large.yaml` starts a new model with twice the experts at birth, four times the resident set and a trunk 768 wide. Raising `resident` changes routing, not only memory - a forward is admitted more of what its text asks for - so compare held-out loss before and after rather than assuming it is free. Its numbers are starting points: run `tools/bench_hw.py` on the machine first.
+**What to expect.** The 8060S is in the same compute class as the reference RTX 3070 Laptop, with less memory bandwidth, so characters per second will be similar or lower - not higher. What it has is memory, roughly twelve times an 8 GB card's.
+
+`configs/strix_halo.yaml` continues the released model and changes nothing that decides what it computes: it holds the whole pool in device memory and raises the disk ceiling. Two things that look free are not, and were measured on the released weights:
+
+- **`resident` stays 32.** At 64 the same weights scored 0.92 nats on held-out chat instead of 0.60, and 1.19 on code instead of 0.71 - the model learned to choose within 32, and a larger card changes what each character routes through.
+- **`context_end` stays 4096.** Held-out is read at the ceiling, and at 8192 the released weights scored 1.66 nats against 0.62: positions past 4,096 are ones it has never been trained on.
+
+`configs/strix_halo_large.yaml` starts a new model trained with the larger card from the beginning - twice the experts at birth, four times the resident set, a trunk 768 wide and an 8k reach. Its numbers are starting points: run `tools/bench_hw.py` on the machine first.
+
+Measured on a Ryzen AI Max+ 395 (Windows, ROCm 7.13 nightly): `strix_halo.yaml` reads about 1,250 characters a second while training, `strix_halo_large.yaml` about 530 at 17.4 GB peak, and paging an expert onto the card takes 0.05 ms from the device-resident tier against 0.5 ms from host memory.
 
 ### Everything else
 
