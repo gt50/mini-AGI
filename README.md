@@ -474,7 +474,7 @@ python tools/bench_hw.py --config configs/strix_halo_large.yaml  # measure befor
 
 | key | what it does |
 |---|---|
-| `gpu_mem_gb` | the budget growth's ROOM brake measures against. **Set it to what the GPU may really use** - the Variable Graphics Memory in AMD Software on Windows, the GTT limit on Linux. torch reports the firmware carve-out as the card's size, which on an APU says little |
+| `gpu_mem_gb` | the budget growth's ROOM brake measures against. **Set it to what the GPU may really use** - the Variable Graphics Memory set in AMD Software. On an APU the size torch reports need not match it |
 | `ram_tier_on_gpu` | holds the expert pool's RAM tier as device tensors, so paging an expert onto the card is a device-to-device copy rather than a blocking host transfer. System memory *is* the card's memory here |
 | `rocm_aotriton` | `TORCH_ROCM_AOTRITON_ENABLE_EXPERIMENTAL=1` - the fast SDPA kernels on RDNA 3.5. Without them the cached forward falls back to math attention, which builds the full score matrix at every row |
 | `tunableop` | `PYTORCH_TUNABLEOP_ENABLED=1`. Off in both profiles: the expert dispatch's matmuls change shape every forward, so it re-tunes nearly every call - a held-out pass ran past half an hour on the 8060S |
@@ -482,7 +482,7 @@ python tools/bench_hw.py --config configs/strix_halo_large.yaml  # measure befor
 
 Every run prints a `hardware:` line naming the device, backend, whether memory is unified, the budget and where it came from.
 
-**Install.** Stock PyTorch wheels do not cover gfx1151. AMD publishes builds for it, for Linux and Windows, from its own index:
+**Install.** Stock PyTorch wheels do not cover gfx1151. AMD publishes Windows builds for it from its own index:
 
 ```bash
 pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch
@@ -490,7 +490,7 @@ pip install --index-url https://rocm.nightlies.amd.com/v2/gfx1151/ --pre torch
 
 Then `pip install -e .[serve,corpora]` for the rest. A later `pip install -U` can pull a CUDA torch from PyPI over the ROCm one, so re-run the line above after any upgrade. Check with `python -c "import torch; print(torch.version.hip, torch.cuda.get_device_properties(0))"`, which should name gfx1151.
 
-**Memory.** On Linux, a small BIOS carve-out with a large GTT allowance is the usual setup - raise the TTM limit on the kernel command line (`ttm.pages_limit` counts 4 KiB pages: 27648000 is about 105 GiB) and set `gpu_mem_gb` a little below it. On Windows, set Variable Graphics Memory in AMD Software and set `gpu_mem_gb` to match.
+**Memory.** Set Variable Graphics Memory in AMD Software and set `gpu_mem_gb` to match. This port is tested on Windows only.
 
 **What to expect.** The 8060S is in the same compute class as the reference RTX 3070 Laptop, with less memory bandwidth, so characters per second will be similar or lower - not higher. What it has is memory, roughly twelve times an 8 GB card's.
 
