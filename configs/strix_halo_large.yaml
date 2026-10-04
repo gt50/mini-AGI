@@ -98,14 +98,14 @@ pool:
 
   capacity_factor: 0      # most of a batch one expert may take, as a multiple
                           # of its fair share; the rest is dropped. 0 removes
-                          # the cap. The cap exists to bound memory on an 8 GB
-                          # card; with 128 experts on the card a fresh model's
-                          # router piles onto a few, and at 1.5 it dropped 59%
-                          # of routing in tools/bench_hw.py (76% in a real
-                          # run's first minutes) - most of what the experts
-                          # could learn. Uncapped, a step was 27% slower and
-                          # peaked at 22.8 GB instead of 17.8. Measured on the
-                          # 8060S: 3 dropped 41%, 6 dropped 25%
+                          # the cap. With 128 experts on the card the router
+                          # grows "sink" experts nearly every character picks
+                          # - 15x the fair share - so any cap drops a lot:
+                          # 1.5 dropped 59% of routing, 4 dropped 30%. The
+                          # grouped dispatch in minagi/pool.py runs each
+                          # expert at its own load, so uncapped costs nothing:
+                          # measured at step 1,938 on the 8060S, 813 char/s
+                          # and 18.8 GB uncapped, 733 char/s capped at 4
 
   # THE BALANCE TERM - how the whole pool gets used. Left alone the router
   # keeps choosing the same experts: reading held-out on its own it put 59 of
@@ -237,8 +237,12 @@ hardware:
   unified: true
   ram_tier_on_gpu: true      # the expert RAM tier lives on the device: a
                              # page-in is a device-to-device copy
-  expandable_segments: true  # turn off if your ROCm build warns it is
-                             # unsupported (some Windows builds)
+  expandable_segments: false  # IGNORED by ROCm on Windows, which warns
+                              # "not supported on this platform". It is what
+                              # stops the allocator fragmenting elsewhere; here
+                              # minagi/pool.py rounds the expert buffer to a few
+                              # sizes instead. Measured before that: 49 GB
+                              # reserved for 17 GB live, half speed, a crash
   rocm_aotriton: true        # fast SDPA kernels on RDNA 3.5; without them a
                              # 4k window builds its whole T x T scores per row
   tunableop: false           # OFF on purpose. The expert dispatch's batched
