@@ -21,7 +21,7 @@ runs/corpus_index.json
 .env.*
 
 # local environments and tool state
-.venv/
+.venv*/
 venv/
 .claude/
 .vscode/
