@@ -649,7 +649,8 @@ def cmd_read(args):
     # sent every new reader straight into a missing core.npz.
     if not os.path.exists(os.path.join(wdir, "core.npz")):
         from minagi.create import create
-        leftovers = ([f for f in os.listdir(wdir) if f != "manifest.json"]
+        leftovers = ([f for f in os.listdir(wdir)
+                      if f not in ("manifest.json", ".lock")]
                      if os.path.isdir(wdir) else [])
         if leftovers:
             # Something is in there, but not a model. Wiping it is not this
@@ -668,6 +669,13 @@ def cmd_read(args):
                   f"config.yaml")
         create(wdir, force=True)
         print()
+    # One writer per directory - see minagi/lock.py. Taken even for a dry
+    # read: paging writes evicted experts back whether or not --save is set.
+    from minagi.lock import Busy, acquire
+    try:
+        acquire(wdir, "train.py read")
+    except Busy as e:
+        raise SystemExit(str(e))
     model, cfg, pool, man = build_paged(wdir, device, args.resident,
                                         args.ram_capacity, args.context)
     # the best held-out this run has seen, for the optional notifier below.
@@ -760,15 +768,9 @@ def cmd_read(args):
                 n_off += 1
         print(f"  pool activations kept, not recomputed ({n_off} call sites) "
               f"- faster, and it needs the memory depth was using")
-    trunk, pool_ps = _split_trunk_pool(model)
-
-    tg = {"params": trunk, "name": "trunk", "weight_decay": args.wd,
-          "lr": args.lr * args.trunk_lr_mult,
-          "base_lr": args.lr * args.trunk_lr_mult}
-    pg = {"params": pool_ps, "name": "pool", "weight_decay": args.wd,
-          "lr": args.lr, "base_lr": args.lr}
-    opt = torch.optim.AdamW([tg, pg], lr=args.lr, betas=(0.9, 0.95),
-                            fused=(device.type == "cuda"))
+    from minagi.build import build_adamw
+    opt, trunk, pool_ps = build_adamw(model, args.lr, args.trunk_lr_mult,
+                                      args.wd)
     snr = GradSNR()
     print(f"  trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
           f"({sum(q.numel() for q in trunk)/1e6:.1f}M trunk, "
@@ -941,6 +943,12 @@ def cmd_read(args):
     # One lane per subject, rotated a window at a time.
     lanes = _lanes(files, args.shuffle_seed, args.paths,
                    resume=int(man.get("read_chars", 0) or 0))
+    # torch's generator gets the same treatment as the lanes', for the same
+    # reason: seeded with --seed alone, every session replayed one random
+    # sequence - the same sampled depths, the same recombination draws at
+    # each growth, the same drawn selections - from wherever it resumed.
+    torch.manual_seed(hash((int(args.seed),
+                            int(man.get("read_chars", 0) or 0))) & (2**63 - 1))
     # How long a subject is read for before the next one. It is a whole
     # number of context windows - a window never spans two subjects, because
     # attention across the seam where chess becomes Python teaches nothing -

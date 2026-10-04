@@ -19,8 +19,10 @@ that actually matters - a window must not span a seam that carries no meaning.
 
 Driven by `python3 -m corpora all`, which knows the datasets each lane wants.
 
-The dataset cache is deleted afterwards unless --keep-cache: converting
-OpenThoughts left thirteen gigabytes of Arrow behind.
+The dataset cache is kept, so a rebuild does not download everything again.
+--drop-cache deletes it afterwards - converting OpenThoughts left thirteen
+gigabytes of Arrow behind - and it is the WHOLE datasets cache, every
+dataset in it, not only the one this run fetched.
 """
 
 import argparse
@@ -78,7 +80,11 @@ def main():
                     help="characters per file; a record is never split")
     ap.add_argument("--shard", type=int, default=2000,
                     help="files per subdirectory")
-    ap.add_argument("--keep-cache", action="store_true")
+    ap.add_argument("--drop-cache", action="store_true",
+                    help="delete the Hugging Face datasets cache afterwards - "
+                         "all of it, not only this dataset")
+    ap.add_argument("--keep-cache", action="store_true",
+                    help="the default now; accepted so old commands still run")
     a = ap.parse_args()
 
     from datasets import load_dataset
@@ -129,12 +135,16 @@ def main():
     print(f"  wrote {files:,} files to {a.out}"
           + (f" and {held:,} to {a.held_out}" if a.held_out else "")
           + f", {chars/1e6:,.1f}M characters ({skipped:,} skipped)", flush=True)
-    if not a.keep_cache:
+    if a.drop_cache and not a.keep_cache:
         # datasets/ only. The parent also holds downloaded models and tokens
         # that this script did not put there and has no business deleting.
-        shutil.rmtree(os.path.expanduser("~/.cache/huggingface/datasets"),
-                      ignore_errors=True)
-        print("  removed the dataset cache", flush=True)
+        # Wherever datasets actually put it: HF_DATASETS_CACHE, then HF_HOME.
+        cache = (os.environ.get("HF_DATASETS_CACHE")
+                 or os.path.join(os.environ.get("HF_HOME") or
+                                 os.path.expanduser("~/.cache/huggingface"),
+                                 "datasets"))
+        shutil.rmtree(cache, ignore_errors=True)
+        print(f"  removed the dataset cache at {cache}", flush=True)
 
     if a.streaming:
         # datasets' streaming reader leaves a worker thread alive, and CPython

@@ -65,20 +65,10 @@ class LiveLearner:
         self.context = int(context or getattr(model.cfg, "block", 16384))
         self.buf = []
         self.pending = 0
-        dev = next(model.parameters()).device
-        trunk = [p for n, p in model.named_parameters()
-                 if not n.startswith("pool.")]
-        pool_ps = [p for n, p in model.named_parameters()
-                   if n.startswith("pool.")]
-        self.opt = torch.optim.AdamW(
-            [{"params": trunk, "name": "trunk", "weight_decay": wd,
-              "lr": lr * trunk_lr_mult, "base_lr": lr * trunk_lr_mult},
-             {"params": pool_ps, "name": "pool", "weight_decay": wd,
-              "lr": lr, "base_lr": lr}],
-            lr=lr, betas=(0.9, 0.95), fused=(dev.type == "cuda"))
-        pool = getattr(model, "pool", None)
-        if pool is not None and hasattr(pool, "attach_optimiser"):
-            pool.attach_optimiser(self.opt)
+        # the same groups training uses - routers with the pool - and the
+        # paged pool attached; see minagi/build.py
+        from minagi.build import build_adamw
+        self.opt, _, _ = build_adamw(model, lr, trunk_lr_mult, wd)
         # ADAM'S MOMENTS carry on from where the weights directory left them,
         # as they do when the trainer resumes. A fresh optimiser would start
         # every tensor from zero moments at the first step - the trunk's and

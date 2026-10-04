@@ -43,6 +43,34 @@ def _split_trunk_pool(model):
     return trunk, pool
 
 
+def build_adamw(model, lr, trunk_lr_mult, wd):
+    """
+    The optimiser every path that trains a model uses, and its two groups.
+
+    The trunk - everything every character passes through - learns at
+    trunk_lr_mult of the pool's rate, because it is where forgetting happens
+    (README, "How continual learning works"). The pool is the experts, their
+    gates and the routers' rows. There were four copies of this, and the
+    server's split by name prefix put the routers in the trunk: in a chat
+    they learned at a tenth of the rate training gives them.
+
+    A paged pool is attached, so each expert on the card is stepped with its
+    own moments. Returns (opt, trunk, pool).
+    """
+    trunk, pool_ps = _split_trunk_pool(model)
+    dev = next(model.parameters()).device
+    tg = {"params": trunk, "name": "trunk", "weight_decay": wd,
+          "lr": lr * trunk_lr_mult, "base_lr": lr * trunk_lr_mult}
+    pg = {"params": pool_ps, "name": "pool", "weight_decay": wd,
+          "lr": lr, "base_lr": lr}
+    opt = torch.optim.AdamW([tg, pg], lr=lr, betas=(0.9, 0.95),
+                            fused=(dev.type == "cuda"))
+    pool = getattr(model, "pool", None)
+    if pool is not None and hasattr(pool, "attach_optimiser"):
+        pool.attach_optimiser(opt)
+    return opt, trunk, pool_ps
+
+
 def build_paged(wdir, device, resident=None, ram_capacity=None, ceiling=None,
                 read_only=False):
     """
