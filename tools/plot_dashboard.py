@@ -83,7 +83,7 @@ def main():
     hist = PE.history(a.history)
     man = {}
     try:
-        man = json.load(open(os.path.join(a.weights, "manifest.json")))
+        man = json.load(open(os.path.join(a.weights, "manifest.json"), encoding="utf-8"))
     except OSError:
         pass
     tel = man.get("telemetry") or {}

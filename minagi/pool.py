@@ -610,11 +610,13 @@ def _mem_frac():
     reserved pool, which stays near 100% once the run is warm whether or not
     there is real room, so a brake reading it would refuse growth forever.
     Peak *allocated* is the honest number - it is what has to fit.
+
+    The denominator is minagi.device's budget rather than the card's reported
+    size, because on an APU the reported size is the firmware carve-out and
+    not what the driver will actually hand out.
     """
-    if not torch.cuda.is_available():
-        return 0.0
-    total = torch.cuda.get_device_properties(0).total_memory
-    return torch.cuda.max_memory_allocated() / max(total, 1)
+    from minagi.device import mem_frac
+    return mem_frac()
 
 
 class AutoGrow:

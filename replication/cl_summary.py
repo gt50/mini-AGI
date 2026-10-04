@@ -29,7 +29,7 @@ RAND = float(np.log(265))
 
 
 def summarise(path):
-    j = json.load(open(path))
+    j = json.load(open(path, encoding="utf-8"))
     doms, base, rows = j["domains"], j["baseline"], j["rows"]
     lanes = j.get("lanes", [j["domain"]])
     read = [d for d in doms if d in lanes]

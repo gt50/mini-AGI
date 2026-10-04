@@ -37,7 +37,14 @@ from dataclasses import asdict
 # MiB free and 861 MiB reserved but unallocated. There was plenty of memory;
 # there was no contiguous piece of it. Set it here rather than in a shell so it
 # is a property of the program, not of how it happened to be launched.
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+#
+# `--config FILE` is taken first because the hardware block of that file is
+# what decides the rest of the environment - ROCm's attention kernels and
+# TunableOp among it. minagi.config and minagi.device do not import torch.
+from minagi.config import take_config_flag  # noqa: E402
+from minagi.device import set_env_before_torch  # noqa: E402
+take_config_flag()
+set_env_before_torch()
 
 import numpy as np
 import torch
@@ -49,6 +56,9 @@ from minagi.stream import StreamSet, Evaluator, detach_caches, ramp_context
 from minagi.plasticity import Plasticity
 from minagi.optim import GradSNR
 from minagi import store as weights_store
+# build_paged and _split_trunk_pool live in the library now; the names stay
+# importable from here for the tools that reach for them as T.build_paged
+from minagi.build import build_paged, _split_trunk_pool  # noqa: F401
 
 
 def lr_at(step, total, base, warmup, floor_frac=0.1):
@@ -118,7 +128,7 @@ def cmd_stream(args):
     wdir = args.weights_dir
     man = None
     if os.path.exists(os.path.join(wdir, "manifest.json")):
-        with open(os.path.join(wdir, "manifest.json")) as f:
+        with open(os.path.join(wdir, "manifest.json"), encoding="utf-8") as f:
             man = json.load(f)
 
     cfgd = dict(man["cfg"]) if man and man.get("cfg") else {}
@@ -213,7 +223,7 @@ def cmd_stream(args):
     # model bug and was not. Appended a line at a time, so an interrupted run
     # keeps everything up to the interruption.
     hist_path = os.path.join(args.out, "history.jsonl")
-    hist = open(hist_path, "a", buffering=1)
+    hist = open(hist_path, "a", buffering=1, encoding="utf-8")
 
     def record(kind, step=None, **kw):
         hist.write(json.dumps({"kind": kind, "step": step, **kw}) + "\n")
@@ -319,7 +329,7 @@ def cmd_stream(args):
                 print(f"  DIVERGED: val {val:.4f} is {val/best:.1f}x the best "
                       f"{best:.4f} - reloading weights/ and halving the "
                       f"learning rate", flush=True)
-                with open(os.path.join(wdir, "manifest.json")) as _f:
+                with open(os.path.join(wdir, "manifest.json"), encoding="utf-8") as _f:
                     man_b = json.load(_f)
                 n_back = int(man_b["n_experts"])
                 if n_back != model.pool.n_experts():
@@ -558,7 +568,7 @@ def _truncate_history(path, chars):
     if not path or not os.path.exists(path) or chars <= 0:
         return
     try:
-        with open(path) as f:
+        with open(path, encoding="utf-8") as f:
             rows = f.read().splitlines()
         keep, dropped = [], 0
         for line in rows:
@@ -570,7 +580,7 @@ def _truncate_history(path, chars):
                 pass                       # keep anything unparseable
             keep.append(line)
         if dropped:
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write("\n".join(keep) + ("\n" if keep else ""))
             print(f"  history: dropped {dropped} row(s) past "
                   f"{chars/1e6:.1f}M - superseded by this resume", flush=True)
@@ -618,6 +628,8 @@ def cmd_read(args):
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
     set_compute_dtype(args.precision)
+    from minagi.device import banner
+    print(banner(device), flush=True)
 
     files = collect(args.paths)
     if not files:
@@ -637,7 +649,8 @@ def cmd_read(args):
     # sent every new reader straight into a missing core.npz.
     if not os.path.exists(os.path.join(wdir, "core.npz")):
         from minagi.create import create
-        leftovers = ([f for f in os.listdir(wdir) if f != "manifest.json"]
+        leftovers = ([f for f in os.listdir(wdir)
+                      if f not in ("manifest.json", ".lock")]
                      if os.path.isdir(wdir) else [])
         if leftovers:
             # Something is in there, but not a model. Wiping it is not this
@@ -656,6 +669,13 @@ def cmd_read(args):
                   f"config.yaml")
         create(wdir, force=True)
         print()
+    # One writer per directory - see minagi/lock.py. Taken even for a dry
+    # read: paging writes evicted experts back whether or not --save is set.
+    from minagi.lock import Busy, acquire
+    try:
+        acquire(wdir, "train.py read")
+    except Busy as e:
+        raise SystemExit(str(e))
     model, cfg, pool, man = build_paged(wdir, device, args.resident,
                                         args.ram_capacity, args.context)
     # the best held-out this run has seen, for the optional notifier below.
@@ -748,15 +768,9 @@ def cmd_read(args):
                 n_off += 1
         print(f"  pool activations kept, not recomputed ({n_off} call sites) "
               f"- faster, and it needs the memory depth was using")
-    trunk, pool_ps = _split_trunk_pool(model)
-
-    tg = {"params": trunk, "name": "trunk", "weight_decay": args.wd,
-          "lr": args.lr * args.trunk_lr_mult,
-          "base_lr": args.lr * args.trunk_lr_mult}
-    pg = {"params": pool_ps, "name": "pool", "weight_decay": args.wd,
-          "lr": args.lr, "base_lr": args.lr}
-    opt = torch.optim.AdamW([tg, pg], lr=args.lr, betas=(0.9, 0.95),
-                            fused=(device.type == "cuda"))
+    from minagi.build import build_adamw
+    opt, trunk, pool_ps = build_adamw(model, args.lr, args.trunk_lr_mult,
+                                      args.wd)
     snr = GradSNR()
     print(f"  trunk learns at {args.trunk_lr_mult:g}x the pool's rate "
           f"({sum(q.numel() for q in trunk)/1e6:.1f}M trunk, "
@@ -855,7 +869,7 @@ def cmd_read(args):
         # Append. A resumed run continues the same model, so wiping the file
         # would throw away the only record of how it got here; the banner is
         # what separates one session from the next.
-        with open(args.sample_log, "a") as f:
+        with open(args.sample_log, "a", encoding="utf-8") as f:
             f.write(f"\n\n{'#' * 78}\n")
             f.write(f"# session started {time.strftime('%Y-%m-%d %H:%M')}  "
                     f"at step {step:,}, {base_chars/1e6:.1f}M of "
@@ -929,6 +943,12 @@ def cmd_read(args):
     # One lane per subject, rotated a window at a time.
     lanes = _lanes(files, args.shuffle_seed, args.paths,
                    resume=int(man.get("read_chars", 0) or 0))
+    # torch's generator gets the same treatment as the lanes', for the same
+    # reason: seeded with --seed alone, every session replayed one random
+    # sequence - the same sampled depths, the same recombination draws at
+    # each growth, the same drawn selections - from wherever it resumed.
+    torch.manual_seed(hash((int(args.seed),
+                            int(man.get("read_chars", 0) or 0))) & (2**63 - 1))
     # How long a subject is read for before the next one. It is a whole
     # number of context windows - a window never spans two subjects, because
     # attention across the seam where chess becomes Python teaches nothing -
@@ -991,7 +1011,7 @@ def cmd_read(args):
                    "last_seen": t.get("last_seen"), "uid": t.get("uid"),
                    "trial": getattr(model.pool, "trial", 0)}
             os.makedirs(os.path.dirname(args.history) or ".", exist_ok=True)
-            with open(args.history, "a") as f:
+            with open(args.history, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, separators=(",", ":")) + "\n")
         except Exception as e:                  # telemetry must never stop a run
             print(f"    (history not written: {e})", flush=True)
@@ -1304,9 +1324,9 @@ def cmd_read(args):
                         print(f"    pool {pool.n_experts()} experts "
                               f"({'+%d' % rec['grew'] if rec['grew'] else ''}"
                               f"{'-%d' % gone if gone else ''})  "
-                              f"{pool.vram_params()/1e6:.1f}M in VRAM  "
-                              f"vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
-                              if device.type == "cuda" else "", flush=True)
+                              f"{pool.vram_params()/1e6:.1f}M in VRAM"
+                              + (f"  vram {torch.cuda.max_memory_allocated()/1e6:.0f}MB"
+                                 if device.type == "cuda" else ""), flush=True)
                 if asked_stop or (args.minutes
                                   and (time.time() - t0) / 60 >= args.minutes):
                     break
@@ -1656,13 +1676,19 @@ def refresh_plots():
         if _PLOTS["since"] is not None:
             c += ["--last", str(_PLOTS["since"])]
         cmds.append(c)
+    # One background python that runs them in order and stops at the first
+    # failure - what `bash -c "a && b"` did, without needing bash, which a
+    # Windows machine does not have.
+    chain = ("import json, subprocess, sys\n"
+             "for c in json.loads(sys.argv[1]):\n"
+             "    if subprocess.run(c).returncode:\n"
+             "        sys.exit(1)\n")
     try:
-        script = " && ".join(" ".join(f'"{x}"' for x in c) for c in cmds)
         _PLOTS["proc"] = subprocess.Popen(
-            ["bash", "-c", script], cwd=here,
+            [sys.executable, "-c", chain, json.dumps(cmds)], cwd=here,
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError:
-        _PLOTS["on"] = False            # no python, no bash - stop trying
+        _PLOTS["on"] = False            # no python to run them - stop trying
 
 
 def write_samples(path, step, chars, minutes, samples, val=None, se=None,
@@ -1670,7 +1696,7 @@ def write_samples(path, step, chars, minutes, samples, val=None, se=None,
                   corpus=None, context=None, ceiling=None, gain=None,
                   rate=None, gnorm=None, clip=None, plast=None,
                   write_rate=None):
-    with open(path, "a") as f:
+    with open(path, "a", encoding="utf-8") as f:
         f.write(f"\n{'=' * 78}\n")
         # How much has been read, against how much there is. A bare count of
         # characters read says nothing on its own - the same 4M is most of a
@@ -1789,138 +1815,6 @@ def write_samples(path, step, chars, minutes, samples, val=None, se=None,
     # the file is closed and complete before the plotter reads it
     refresh_plots()
     return path
-
-def _split_trunk_pool(model):
-    """
-    Which parameters are the pool's, and which are the shared body.
-
-    A resident pool keeps its experts as modules; a paged pool keeps three
-    stacked slot tensors instead, so the set has to be found by asking the
-    pool rather than by walking a ModuleList that is not there.
-    """
-    p = model.pool
-    ids = {id(p.gate)}
-    if hasattr(p, "experts") and p.experts is not None:
-        ids |= {id(q) for e in p.experts for q in e.parameters()}
-    for nm in ("w1", "w3", "w2"):
-        obj = getattr(p, nm, None)
-        if obj is None:
-            continue
-        ids |= ({id(obj)} if torch.is_tensor(obj)
-                else {id(q) for q in obj.parameters()})
-    for s in model.modules():
-        if isinstance(s, PooledMLP):
-            ids.add(id(s.router.weight))
-            ids.add(id(s.depth_emb))
-    trunk = [q for q in model.parameters() if id(q) not in ids]
-    pool = [q for q in model.parameters() if id(q) in ids]
-    return trunk, pool
-
-
-def build_paged(wdir, device, resident=None, ram_capacity=256, ceiling=None,
-                read_only=False):
-    """
-    Load the model with its pool on disk rather than in VRAM.
-
-    The three tiers the project describes: every expert is a file, RAM keeps
-    the recently wanted ones, and the card holds the experts the current
-    forward admitted. While a forward has room on the card, every character ranks the
-    whole pool; a forward may use at most `resident` experts, the ones its
-    characters ask for most - see PagedPool.admit.
-
-    read_only makes the pool incapable of writing to `wdir`. Pass it from any
-    tool that inspects a directory a training run may own - paging an expert in
-    marks it dirty whether or not anything touched it, so a plain read would
-    otherwise write expert files back under the run.
-    """
-    from minagi.paged import PagedPool
-    with open(os.path.join(wdir, "manifest.json")) as f:
-        man = json.load(f)
-    cfgd = dict(man["cfg"])
-    resident = resident or cfgd.get("pool_resident") or cfgd["pool_top_k"]
-    cfg = RecurConfig(**{k: v for k, v in cfgd.items()
-                         if k in RecurConfig.__dataclass_fields__})
-    # The capacity bound comes from config.yaml rather than from the
-    # checkpoint, because it is a property of the machine the model is running
-    # on - how much VRAM the dispatch may use - not of the model. A directory
-    # written before this existed carries no value for it and would otherwise
-    # get the dataclass default, which is right but silent; taking it from the
-    # config every load means the number in the file is the number in effect.
-    try:
-        from minagi.config import load as _load_cfg, get as _get_cfg
-        _c = _load_cfg()
-        cfg.pool_capacity_factor = float(
-            _get_cfg(_c, "pool.capacity_factor", cfg.pool_capacity_factor))
-    except Exception:
-        pass
-    # the per-token router keeps one row per EXPERT, not per VRAM slot, so it
-    # is sized by the pool and grows with it - see PooledMLP.__init__
-    # EXACTLY what the pool holds. pool_max sizes the routers, which keep one
-    # row per expert, so a checkpoint's router weights only fit a model built
-    # at the same count - one row too many and load_state_dict refuses the
-    # whole model.
-    #
-    # It was briefly max(cfg.pool_max, n_experts) to stop `stream` latching
-    # its growth ceiling to the pool's current size. That conflated two jobs
-    # in one number: sizing the routers, and capping growth. The manifest's
-    # pool_max ratchets up and never comes down, so after a prune took the
-    # pool from 158 to 157 the max() still read 158 and the directory would
-    # not load at all. The ceiling now lives in `stream` where it belongs.
-    cfg.pool_max = int(man["n_experts"])
-    if ceiling and ceiling > cfg.block:
-        # RoPE tables are built to cfg.block and carry no learned parameters,
-        # so raising the ceiling on an existing model costs a bigger table and
-        # nothing else. The window the reader actually uses is separate, and
-        # grows a character at a time.
-        cfg.block = int(ceiling)
-    model = RecurCoder(cfg).to(device)
-    pool = PagedPool(os.path.join(wdir, "experts"), cfg.d_model, cfg.pool_d_ff,
-                     int(man["n_experts"]), resident=resident,
-                     ram_capacity=ram_capacity, device=device,
-                     read_only=read_only).to(device)
-    for m in model.modules():
-        if isinstance(m, PooledMLP):
-            m._pool[0] = pool
-    model.pool = pool
-    pool.attach_sites(model)
-    pool.load_telemetry(man.get("telemetry"))
-    # The balance term's weight and the temperature of expert selection - see
-    # PagedPool.note_balance and PagedPool._draw. Read from config.yaml at
-    # every load, like the capacity bound: they are choices about how the model
-    # trains and chooses, not properties of its weights.
-    try:
-        from minagi.config import load as _load_cfg, get as _get_cfg
-        _c = _load_cfg()
-        pool.balance = float(_get_cfg(_c, "pool.balance", 0.0) or 0.0)
-        pool.select_temperature = float(
-            _get_cfg(_c, "pool.select_temperature", 0.0) or 0.0)
-    except Exception:
-        pass
-    ever = cfgd.get("pool_ever")
-    if ever:
-        n = min(len(ever), pool.ever.numel())
-        pool.ever[:n] = torch.tensor(ever[:n], dtype=torch.bool,
-                                     device=pool.ever.device)
-    # the trunk still comes from the bundles; the experts come from their files
-    core = np.load(os.path.join(wdir, "core.npz"))
-    rout = np.load(os.path.join(wdir, "routers.npz"))
-    sd = {k: torch.from_numpy(core[k]) for k in core.files}
-    # Router rows belong to EXPERTS, not to VRAM slots, so they are loaded
-    # whole. Slicing them to the resident count - which this did, left over
-    # from when rows were slots - silently discarded every expert past the
-    # card and made any resume after growth fail to load.
-    for k in rout.files:
-        # The segment router chose working sets before selection moved into
-        # the router itself; directories written then still carry its rows.
-        if k.startswith("pool.segment_router."):
-            continue
-        sd[k] = torch.from_numpy(rout[k])
-    missing, unexpected = model.load_state_dict(sd, strict=False)
-    bad = [k for k in unexpected if "router" in k or "gate" in k]
-    if bad:
-        raise RuntimeError(f"router/gate tensors did not load: {bad}")
-    return model, cfg, pool, man
-
 
 def cmd_ponder_probe(args):
     """

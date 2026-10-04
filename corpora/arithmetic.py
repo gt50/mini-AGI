@@ -279,7 +279,7 @@ def main():
             "val_tokens": val_total, "tasks": list(TASKS),
             "tokenizer": "byte",
             "note": "answers in normal order; scratchpads show derivable steps"}
-    json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), indent=2)
+    json.dump(meta, open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8"), indent=2)
     print(f"wrote {args.out}/meta.json")
     return 0
 

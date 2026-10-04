@@ -14,7 +14,7 @@ import torch
 
 class Corpus:
     def __init__(self, data_dir, device, block, batch):
-        self.meta = json.load(open(os.path.join(data_dir, "meta.json")))
+        self.meta = json.load(open(os.path.join(data_dir, "meta.json"), encoding="utf-8"))
         self.train = np.memmap(os.path.join(data_dir, "train.bin"),
                                dtype=np.uint16, mode="r")
         self.val = np.memmap(os.path.join(data_dir, "val.bin"),

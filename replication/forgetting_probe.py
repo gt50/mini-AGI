@@ -178,15 +178,12 @@ def main():
     doms = sorted(ev.groups)
     print(f"  scoring {len(doms)} held-out domains: {', '.join(doms)}")
 
-    trunk, pool_ps = T._split_trunk_pool(model)
-    tg = {"params": trunk, "name": "trunk", "weight_decay": a.wd,
-          "lr": a.lr * a.trunk_lr_mult}
-    pg = {"params": pool_ps, "name": "pool", "weight_decay": a.wd, "lr": a.lr}
-    opt = torch.optim.AdamW([tg, pg], lr=a.lr, betas=(0.9, 0.95))
     # The pool steps every expert on the card with that expert's own moments,
-    # which it can only do if it knows the optimiser. Unattached, an expert
-    # paged in was stepped with whatever its slot held for the one before.
-    pool.attach_optimiser(opt)
+    # which it can only do if it knows the optimiser - build_adamw attaches
+    # it. Unattached, an expert paged in was stepped with whatever its slot
+    # held for the one before.
+    from minagi.build import build_adamw
+    opt, trunk, pool_ps = build_adamw(model, a.lr, a.trunk_lr_mult, a.wd)
     if not a.cold_optim:
         from minagi.store import _load_optim
         try:
@@ -369,7 +366,7 @@ def main():
            "domains": doms, "baseline": {k: base[k] for k in doms},
            "rows": rows}
     os.makedirs(os.path.dirname(a.out) or ".", exist_ok=True)
-    with open(a.out, "w") as f:
+    with open(a.out, "w", encoding="utf-8") as f:
         json.dump(out, f, indent=1)
     print(f"\n  -> {a.out}")
 

@@ -109,12 +109,21 @@ class Tiers:
     """
 
     def __init__(self, path, d_model, d_ff, ram_capacity=256, device="cpu",
-                 read_only=False):
+                 read_only=False, tier_on_device=False):
         self.path = path
         self.d_model, self.d_ff = d_model, d_ff
-        self.ram = OrderedDict()             # id -> dict of CPU tensors
+        self.ram = OrderedDict()             # id -> dict of tensors
+        # 0 keeps every expert the pool has: nothing is evicted, and disk is
+        # read once per expert and written only at a flush
         self.ram_capacity = ram_capacity
         self.device = device
+        # Where the "RAM" tier lives. On a discrete card it is system memory
+        # and every page-in is a host-to-device copy. On a unified-memory APU
+        # (Strix Halo) system memory IS the card's memory, so the tier can be
+        # held as device tensors: a page-in becomes a device-to-device copy,
+        # parking an expert never crosses to the host, and only a disk write
+        # does. See minagi.device.ram_tier_on_gpu.
+        self.store = torch.device(device) if tier_on_device else torch.device("cpu")
         # Read-only means exactly that: nothing is ever marked dirty and
         # nothing is ever written. Needed because paging an expert IN marks it
         # dirty regardless of whether anything changed it, so a visualisation
@@ -139,13 +148,19 @@ class Tiers:
         file the whole of what that expert is, which is what the weights
         directory claims about itself.
         """
-        z = np.load(self._file(i))
-        out = {k: torch.from_numpy(z[k]).clone() for k in ("w1", "w3", "w2")}
-        for k in ("w1_m", "w3_m", "w2_m", "w1_v", "w3_v", "w2_v"):
-            if k in z.files:
-                # bf16 if this file has been written since the moments were
-                # narrowed, fp32 if it has not; unpack_bf16 reads both
-                out[k] = unpack_bf16(z[k]).clone()
+        # Every z[k] is a fresh array, so the tensors may share its memory;
+        # `with` closes the file, which Windows needs before it can be
+        # replaced by the next write-back.
+        with np.load(self._file(i)) as z:
+            out = {k: torch.from_numpy(z[k]).to(self.store)
+                   for k in ("w1", "w3", "w2")}
+            for k in ("w1_m", "w3_m", "w2_m", "w1_v", "w3_v", "w2_v"):
+                if k in z.files:
+                    # bf16 if this file has been written since the moments
+                    # were narrowed, fp32 if it has not; unpack_bf16 reads
+                    # both. Moved first, so a device tier carries half the
+                    # bytes across and widens them where they will live.
+                    out[k] = unpack_bf16(torch.from_numpy(z[k]).to(self.store))
         return out
 
     def fetch(self, i, count=True):
@@ -167,6 +182,9 @@ class Tiers:
 
     def put(self, i, tensors, dirty=True):
         """Hand an expert back after it has been resident."""
+        # a no-op when they are already where the tier lives
+        tensors = {k: (v.to(self.store) if torch.is_tensor(v) else v)
+                   for k, v in tensors.items()}
         self.ram[i] = tensors
         self.ram.move_to_end(i)
         if dirty and not self.read_only:
@@ -174,7 +192,7 @@ class Tiers:
         self._trim()
 
     def _trim(self):
-        while len(self.ram) > self.ram_capacity:
+        while self.ram_capacity and len(self.ram) > self.ram_capacity:
             j, ent = self.ram.popitem(last=False)      # least recently used
             self.evictions += 1
             if j in self.dirty:
@@ -189,7 +207,8 @@ class Tiers:
         # what they need is exponent range and bf16 keeps all of fp32's. The
         # weights cannot go with them - see minagi/precision.py, which has the
         # measurement for both.
-        arrays = {k: (pack_bf16(v) if is_moment(k) else v.to(torch.float32).numpy())
+        arrays = {k: (pack_bf16(v) if is_moment(k)
+                      else v.detach().to("cpu", torch.float32).numpy())
                   for k, v in ent.items() if torch.is_tensor(v)}
         tmp = self._file(i) + ".tmp.npz"
         np.savez(tmp, **arrays)
@@ -227,7 +246,7 @@ class PagedPool(nn.Module):
 
     def __init__(self, path, d_model, d_ff, n_experts, resident=16,
                  ram_capacity=256, device="cpu", max_experts=1_000_000,
-                 read_only=False):
+                 read_only=False, tier_on_device=False):
         super().__init__()
         self.path = path
         self.d_model, self.d_ff = d_model, d_ff
@@ -236,7 +255,7 @@ class PagedPool(nn.Module):
         self._n = n_experts
         self.read_only = read_only
         self.tiers = Tiers(path, d_model, d_ff, ram_capacity, device,
-                           read_only=read_only)
+                           read_only=read_only, tier_on_device=tier_on_device)
 
         # the VRAM slots - fixed in number, their contents swapped
         self.w1 = nn.Parameter(torch.zeros(self.resident, d_ff, d_model))
@@ -718,13 +737,16 @@ class PagedPool(nn.Module):
         holds. An entry replaces the old one whole, so it never leaves them out.
         """
         tensors = ((self.w1, "w1"), (self.w3, "w3"), (self.w2, "w2"))
-        ent = {nm: p.data[s].detach().to("cpu").clone() for p, nm in tensors}
+        # one copy each, to wherever the tier lives: the slot is reused by the
+        # next expert, so the entry cannot be a view of it
+        to = self.tiers.store
+        ent = {nm: p.data[s].detach().to(to, copy=True) for p, nm in tensors}
         if self._own[s]:
             for p, nm in tensors:
                 o = st.get(p)
                 if o and "exp_avg" in o:
-                    ent[nm + "_m"] = o["exp_avg"][s].to("cpu").clone()
-                    ent[nm + "_v"] = o["exp_avg_sq"][s].to("cpu").clone()
+                    ent[nm + "_m"] = o["exp_avg"][s].to(to, copy=True)
+                    ent[nm + "_v"] = o["exp_avg_sq"][s].to(to, copy=True)
         else:
             ent.update({k: v for k, v in
                         self.tiers.fetch(self._f(e), count=False).items()

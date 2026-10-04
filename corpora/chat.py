@@ -129,7 +129,7 @@ def _self_facts():
                         key=os.path.getmtime, reverse=True)
     for q in cands:
         try:
-            man = json.load(open(q))
+            man = json.load(open(q, encoding="utf-8"))
             break
         except Exception:
             continue
@@ -212,7 +212,7 @@ def _load_self_knowledge():
                      "self_knowledge.yaml")
     if not os.path.exists(p):
         return []
-    with open(p) as fh:
+    with open(p, encoding="utf-8") as fh:
         doc = yaml.safe_load(fh) or []
     out = []
     for item in doc:
@@ -497,7 +497,7 @@ def main():
                "val_tokens": va, "pairs": len(pairs),
                "tokenizer": "byte",
                "format": f"{U0}...{U1}{B0}...{B1}"},
-              open(os.path.join(args.out, "meta.json"), "w"), indent=2)
+              open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8"), indent=2)
     print(f"wrote {args.out}/meta.json")
     return 0
 

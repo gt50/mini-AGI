@@ -82,7 +82,7 @@ class ByteTokenizer:
 def load_tokenizer(data_dir):
     meta_path = os.path.join(data_dir, "meta.json")
     if os.path.exists(meta_path):
-        meta = json.load(open(meta_path))
+        meta = json.load(open(meta_path, encoding="utf-8"))
         if meta.get("tokenizer") == "byte":
             return ByteTokenizer()
     from tokenizers import Tokenizer

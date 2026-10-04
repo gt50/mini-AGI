@@ -71,7 +71,7 @@ def label(d):
 
 
 def fig_probe(path, out):
-    j = json.load(open(path))
+    j = json.load(open(path, encoding="utf-8"))
     doms, rows = j["domains"], j["rows"]
     base = j["baseline"]
     lanes = [d for d in j.get("lanes", [j["domain"]]) if d in doms]
@@ -209,7 +209,7 @@ def fig_ablation(out):
          "swapping normally, trunk at 0.1x   (the run)", "#2a78d6", "-", 2.7),
     ]
     RAND = float(np.log(265))
-    _j0 = json.load(open(SPECS[-1][0]))
+    _j0 = json.load(open(SPECS[-1][0], encoding="utf-8"))
     READ = label(_j0["domain"])
     NOTH = len([d for d in _j0["domains"]
                 if d not in _j0.get("lanes", [_j0["domain"]])])
@@ -220,7 +220,7 @@ def fig_ablation(out):
         gridspec_kw={"width_ratios": [1.5, 1.15, 1]})
 
     if os.path.exists(R("control.json")):
-        c = json.load(open(R("control.json")))
+        c = json.load(open(R("control.json"), encoding="utf-8"))
         rd = _mean_delta(c, "read")
         if rd:
             ax.plot([x / 1000 for x, _ in rd], [y for _, y in rd],
@@ -232,7 +232,7 @@ def fig_ablation(out):
     for path, name, col, dash, lw in SPECS:
         if not os.path.exists(path):
             continue
-        j = json.load(open(path))
+        j = json.load(open(path, encoding="utf-8"))
         d = _mean_delta(j)
         xs = [x / 1000 for x, _ in d]; ys = [y for _, y in d]
         xmax = max(xmax, xs[-1])

@@ -37,6 +37,11 @@ class GradSNR:
         if not gs:
             return None
         flat = torch.cat([g.detach().float().reshape(-1) for g in gs])
+        if self.m is not None and self.m.shape != flat.shape:
+            # A tensor it watches changed size - growth adds a row per
+            # newborn to tensors outside the pool too - so the running mean
+            # no longer lines up with the gradient. Start the meter over.
+            self.m, self.sq, self.n = None, 0.0, 0
         self.m = flat.clone() if self.m is None else \
             self.m.mul_(self.beta).add_(flat, alpha=1 - self.beta)
         s = float((flat * flat).sum())

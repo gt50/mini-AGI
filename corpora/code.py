@@ -228,7 +228,7 @@ def _encode(args, flat, tok, paths, total_bytes, roots):
         "self_close_id": tok.token_to_id(SELF_CLOSE),
         "roots": roots,
     }
-    with open(os.path.join(args.out, "meta.json"), "w") as f:
+    with open(os.path.join(args.out, "meta.json"), "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
 
     print(f"\ntrain {counts['train']:,} tokens ({counts['train']*2/1e6:.0f} MB)")

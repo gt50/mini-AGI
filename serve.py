@@ -30,8 +30,12 @@ import threading
 import time
 
 # see train.py: the allocator reads this once at CUDA init, so it has to be
-# set before torch loads
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+# set before torch loads - and `--config` picks the file whose hardware block
+# decides it
+from minagi.config import take_config_flag  # noqa: E402
+from minagi.device import set_env_before_torch  # noqa: E402
+take_config_flag()
+set_env_before_torch()
 
 import torch
 from flask import Flask, Response, jsonify, request
@@ -48,6 +52,37 @@ LOCK = threading.Lock()
 STATE = {"model": None, "tok": None, "weights": None, "learner": None}
 
 U0, U1, B0, B1 = "<user>", "</user>", "<bot>", "</bot>"
+
+# The most characters one reply may ask for. Generation holds LOCK, so an
+# unbounded request would hold every other conversation for as long as it
+# liked.
+MAX_NEW = 2048
+
+# Host names a request may address when the server is bound to loopback. A
+# page on another site can make the browser POST here; checking Origin
+# refuses that, and checking Host refuses the DNS-rebinding form of it, where
+# the attacker's name resolves to 127.0.0.1 and Origin matches Host. None
+# when bound to a public interface, where the names are not knowable.
+ALLOWED_HOSTS = None
+LOOPBACK = ("127.0.0.1", "localhost", "::1")
+
+
+def _hostname(netloc):
+    if netloc.startswith("["):
+        return netloc[1:netloc.find("]")]
+    return netloc.rsplit(":", 1)[0] if netloc.count(":") == 1 else netloc
+
+
+def _refuse_foreign():
+    """A response refusing a request from outside, or None to serve it."""
+    from urllib.parse import urlparse
+    if (ALLOWED_HOSTS is not None
+            and _hostname(request.host) not in ALLOWED_HOSTS):
+        return jsonify(error="unknown Host"), 403
+    origin = request.headers.get("Origin")
+    if origin and urlparse(origin).netloc != request.host:
+        return jsonify(error="cross-origin request refused"), 403
+    return None
 
 # A passage of the corpus the conversation opens with. Empty when priming is
 # off or no corpus is on disk.
@@ -89,7 +124,7 @@ def load_prime(chars, root="data/train/self-knowledge"):
     names = ([n for n in names if n.startswith("self-")]
              + [n for n in names if not n.startswith("self-")])
     for name in names[:20]:
-        with open(os.path.join(root, name), errors="replace") as f:
+        with open(os.path.join(root, name), errors="replace", encoding="utf-8") as f:
             text = f.read(chars * 3)
         best = ""
         at = text.find(f"{B1}\n")
@@ -108,7 +143,7 @@ def load_prime(chars, root="data/train/self-knowledge"):
 def _manifest(path):
     """As loaded, so a save does not overwrite it with a blank one."""
     try:
-        with open(os.path.join(path, "manifest.json")) as f:
+        with open(os.path.join(path, "manifest.json"), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, ValueError):
         return {}
@@ -133,7 +168,9 @@ def load(weights, device=None, learn=True, lr=3e-4, save_every=8,
         print("[warn] CUDA is full, serving on CPU", file=sys.stderr)
     model.eval()
     STATE.update(model=model, tok=ByteTokenizer(), weights=weights)
+    from minagi.device import banner
     print(f"[loaded] {weights} on {dev}", file=sys.stderr)
+    print(f"[{banner(dev)}]", file=sys.stderr)
 
     # A paged model loads with an EMPTY card - every slot -1. A reply is
     # admitted by its own text's vote, so this does not change a reply; what
@@ -239,6 +276,7 @@ def build_prompt(messages, budget, prime=""):
 def stream(prompt, max_new):
     from minagi.config import get as _g, load as _lc
     from minagi.decode import pick_next
+    from minagi.precision import amp
     from minagi.stream import trim_caches
 
     c = _lc()
@@ -284,7 +322,11 @@ def stream(prompt, max_new):
     for i in range(0, out.shape[1], CHUNK):
         part = out[:, i:i + CHUNK]
         trim_caches(caches, model.cfg.block - part.shape[1])
-        logits = model(part, caches=caches, pos_offset=where(caches))[0]
+        # In the compute dtype training runs in - bf16 by default. Without
+        # it a reply ran fp32 everywhere but the expert dispatch. Entered per
+        # forward rather than around the generator, which yields in between.
+        with amp(device):
+            logits = model(part, caches=caches, pos_offset=where(caches))[0]
 
     cur = out[:, -1:]
     produced = []
@@ -295,7 +337,8 @@ def stream(prompt, max_new):
         loads = getattr(pool, "loads", 0)
         if logits is None:
             trim_caches(caches, model.cfg.block - cur.shape[1])
-            logits = model(cur, caches=caches, pos_offset=where(caches))[0]
+            with amp(device):
+                logits = model(cur, caches=caches, pos_offset=where(caches))[0]
             moved = getattr(pool, "loads", 0) - loads
             if moved:
                 # this character asked for experts that were not on the card;
@@ -357,11 +400,25 @@ def remember(user_text, bot_text):
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
-    body = request.get_json(force=True)
+    # What is said here is trained into the weights on disk, so who may say
+    # it matters. JSON only: a cross-site form or a text/plain fetch is a
+    # "simple" request the browser sends without asking, and force=True used
+    # to parse it anyway.
+    bad = _refuse_foreign()
+    if bad is not None:
+        return bad
+    if not request.is_json:
+        return jsonify(error="send application/json"), 415
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return jsonify(error="the body is not a JSON object"), 400
     model = STATE["model"]
-    msgs = body.get("messages", [])
+    msgs = [m for m in body.get("messages", []) if isinstance(m, dict)]
     prompt = build_prompt(msgs, int(model.cfg.block * 0.9), PRIME)
-    max_new = int(body.get("max_new", 400))
+    try:
+        max_new = max(1, min(int(body.get("max_new", 400)), MAX_NEW))
+    except (TypeError, ValueError):
+        return jsonify(error="max_new must be a number"), 400
     # the half of the exchange the model did not predict, which is where the
     # signal in a conversation is
     last_user = next((m.get("content") for m in reversed(msgs)
@@ -832,6 +889,10 @@ def main():
                          "the cost of a denser diet than documents give")
     ap.add_argument("--save-every", type=int, default=8,
                     help="optimiser steps between writing the weights out")
+    ap.add_argument("--allow-remote-learning", action="store_true",
+                    help="keep learning on when --host is not loopback. Off "
+                         "by default: anyone who can reach the port would be "
+                         "writing to the weights")
     ap.add_argument("--precision", default=None,
                     choices=["bf16", "fp16", "fp32"],
                     help="what the forward computes in; defaults to whatever "
@@ -853,6 +914,25 @@ def main():
     if args.prime_chars and not PRIME:
         print("  no corpus to prime from - the router will choose experts "
               "from the prompt alone", file=sys.stderr)
+
+    global ALLOWED_HOSTS
+    if args.host in LOOPBACK:
+        ALLOWED_HOSTS = set(LOOPBACK)
+    elif args.learn and not args.allow_remote_learning:
+        print(f"  --host {args.host} is reachable from other machines, so "
+              f"learning is OFF. --allow-remote-learning turns it back on.",
+              file=sys.stderr)
+        args.learn = False
+
+    if args.learn:
+        # One writer per directory: a training run reading into it at the
+        # same time would have its experts written over, and its manifest.
+        from minagi.lock import Busy, acquire
+        try:
+            acquire(args.weights, "serve.py (learning)")
+        except Busy as e:
+            print(f"  {e}\n  Serving READ-ONLY instead.", file=sys.stderr)
+            args.learn = False
 
     if args.learn:
         print(f"\n  LEARNING IS ON. Talking to this model CHANGES "
