@@ -786,7 +786,19 @@ def cmd_read(args):
     eval_steps = max(1, int(args.eval_chunks) // max(1, args.chunk))
     sample_eval_steps = max(1, int(args.sample_eval_chunks)
                             // max(1, args.chunk))
-    ev = (FolderEvaluator(model, args.held_out, args.chunk, cfg.block, device)
+    #
+    # AT THE WINDOW, NOT THE CEILING. This was built with cfg.block and never
+    # moved, so held-out was read at the ceiling while the model read at its
+    # window. On the large Strix profile - window 2,367 of 8,192 - that scored
+    # every subject 0.7 to 1.1 nats worse than the same text at the window,
+    # flattened held-out while training kept improving, and held growth's
+    # HONEST brake (train vs held-out) shut for the whole night. It went
+    # unnoticed while the released model's window had reached its ceiling,
+    # where the two are the same. `stream` already moves its evaluator with
+    # the window; this now does too, before every run below.
+    ev_ctx = max(64, min(int(man.get("context_now") or args.context_start),
+                         int(cfg.block), int(args.context)))
+    ev = (FolderEvaluator(model, args.held_out, args.chunk, ev_ctx, device)
           if args.held_out and os.path.isdir(args.held_out) else None)
     before = None
     if ev is not None:
@@ -1184,6 +1196,7 @@ def cmd_read(args):
                     v_ = se_ = None
                     dom = None
                     if ev is not None:
+                        ev.context = ctx_now        # the window, as it is now
                         d = ev.run(sample_eval_steps)
                         se_ = d.pop("stderr", None)
                         v_ = float(np.mean(list(d.values())))
@@ -1371,6 +1384,7 @@ def cmd_read(args):
         print(f"  mean loss over the files: {np.mean(losses):.4f}")
 
     if ev is not None:
+        ev.context = ctx_now                # the window it ended at
         v = ev.run(eval_steps); se = v.pop("stderr", 0.0)
         after = float(np.mean(list(v.values())))
         d = after - before
